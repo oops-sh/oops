@@ -41,11 +41,11 @@ session is consumed — `oops diff` reports no pending sandbox. Backends
 that never modify the target during undo (e.g. OverlayFS, which discards
 a layer) automatically satisfy clause 1 by doing nothing to the target.
 
-#### Scenario: Corrupted session state points outside the state roots
+#### Scenario: Corrupted session state points outside the state directory
 - **WHEN** the pending-session record names a snapshot or layer path outside every registered state root and `oops undo` is invoked
 - **THEN** oops refuses to act on that path, deletes nothing, and exits non-zero reporting the corrupted state
 
-#### Scenario: Normal undo (interception backend)
+#### Scenario: Normal undo
 - **WHEN** `oops undo` runs against a valid pending OverlayFS sandbox
 - **THEN** the only paths removed are the sandbox's layers and session record, all inside a registered state root; the target is not modified
 
