@@ -1,5 +1,5 @@
-// Parts of the backend surface are only exercised on Linux.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+// Parts of the backend surface are only exercised per-platform.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 mod backend;
 mod diff;
 mod session;
@@ -10,8 +10,19 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use backend::Sandbox;
+use state::StateRoots;
 
+#[cfg(target_os = "macos")]
+const SCOPE_NOTE: &str = "\
+Guarantee boundary: the sandbox covers filesystem writes under the current \
+directory tree only. Writes outside it (/tmp, $HOME, other mounts), network \
+side effects, and spawned processes are NOT captured and cannot be undone.\n\
+On macOS the model is snapshot-restore: the command runs against your real \
+files and `oops undo` puts them back — between run and undo/commit the tree \
+holds the command's changes, and cloud sync clients or file watchers can \
+observe (and may propagate) that transient state.";
+
+#[cfg(not(target_os = "macos"))]
 const SCOPE_NOTE: &str = "\
 Guarantee boundary: the sandbox covers filesystem writes under the current \
 directory tree only. Writes outside it (/tmp, $HOME, other mounts), network \
@@ -44,9 +55,9 @@ enum Cmd {
         #[arg(long)]
         porcelain: bool,
     },
-    /// Discard the pending sandbox; the real files are untouched
+    /// Discard the pending sandbox, restoring your files
     Undo,
-    /// Apply the pending sandbox to the real files
+    /// Keep the pending sandbox's changes
     Commit,
     /// Internal: sandbox child (unshare + mount + exec)
     #[command(name = "__exec", hide = true)]
@@ -87,7 +98,7 @@ fn dispatch(cmd: Cmd) -> Result<i32> {
         Cmd::Undo => undo(),
         Cmd::Commit => commit(),
         Cmd::Gc => {
-            session::gc_sweep(&state::state_dir()?)?;
+            session::gc_sweep(&StateRoots::load()?)?;
             Ok(0)
         }
         Cmd::Exec {
@@ -116,22 +127,33 @@ fn target_dir() -> Result<PathBuf> {
         .context("cannot resolve the current directory")
 }
 
-fn pending_session(state: &Path) -> Result<session::Session> {
-    let target = target_dir()?;
-    session::find_for_target(state, &target)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "no pending sandbox for {} — run something first: oops run \"<command>\"",
-            target.display()
-        )
-    })
-}
-
-fn sandbox_of(record: &session::SessionRecord) -> Sandbox {
-    Sandbox {
-        target: record.target.clone(),
-        upper: record.upper.clone(),
-        work: record.work.clone(),
+/// Find the pending session for where the user is. Primary key: canonical
+/// cwd. Fallback: the logical `$PWD` — after `oops run` deleted or replaced
+/// the target directory itself, getcwd fails (or resolves elsewhere), but
+/// the shell's $PWD still names the recorded target, which is exactly the
+/// situation undo exists to fix.
+fn pending_session(roots: &StateRoots) -> Result<session::Session> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = target_dir() {
+        candidates.push(cwd);
     }
+    if let Some(pwd) = std::env::var_os("PWD").map(PathBuf::from) {
+        if pwd.is_absolute() && !candidates.contains(&pwd) {
+            candidates.push(pwd);
+        }
+    }
+    if candidates.is_empty() {
+        bail!("cannot resolve the current directory (and $PWD is not set)");
+    }
+    for candidate in &candidates {
+        if let Some(sess) = session::find_for_target(roots, candidate)? {
+            return Ok(sess);
+        }
+    }
+    bail!(
+        "no pending sandbox for {} — run something first: oops run \"<command>\"",
+        candidates[0].display()
+    )
 }
 
 fn run(command: &str) -> Result<i32> {
@@ -139,10 +161,8 @@ fn run(command: &str) -> Result<i32> {
     // this refuses up front (fail closed) — the command never runs.
     let backend = backend::select()?;
 
-    let state = state::state_dir()?;
-    std::fs::create_dir_all(state::sessions_dir(&state))?;
-    std::fs::create_dir_all(state::trash_dir(&state))?;
-    if let Err(e) = session::gc_sweep(&state) {
+    let mut roots = StateRoots::load()?;
+    if let Err(e) = session::gc_sweep(&roots) {
         eprintln!("oops: warning: gc sweep failed: {e:#}");
     }
 
@@ -150,29 +170,26 @@ fn run(command: &str) -> Result<i32> {
     if target == Path::new("/") {
         bail!("refusing to sandbox the filesystem root");
     }
-    if target.starts_with(&state) || state.starts_with(&target) {
+    let root = roots.root_for_target(&target)?;
+    if target.starts_with(&root) || root.starts_with(&target) {
         bail!("refusing to sandbox a directory that contains or lives in the oops state directory");
     }
-    session::ensure_no_pending(&state, &target)?;
+    session::ensure_no_pending(&roots, &target)?;
 
-    let sess = session::create(&state, &target, command)?;
-    let sandbox = sandbox_of(&sess.record);
-    let marker = backend::marker_path(&sandbox);
+    let sess = session::create(&root, &target, command, backend.kind())?;
+    let sandbox = backend::sandbox_of(&sess.dir, &sess.record)?;
 
     let status = match backend.exec(&sandbox, command) {
         Ok(status) => status,
         Err(e) => {
-            discard_session(&state, &sess.dir);
+            // Contract: exec Err ⇒ the command never executed. Fail closed
+            // and discard the (unused) session.
+            if session::move_to_trash(&roots, &sess.root, &sess.dir).is_ok() {
+                session::spawn_background_gc();
+            }
             return Err(e);
         }
     };
-
-    if !marker.exists() {
-        // The child died before exec'ing the command: sandbox setup failed.
-        // The command never ran; discard the empty session. Fail closed.
-        discard_session(&state, &sess.dir);
-        bail!("sandbox setup failed (see the message above); the command was NOT executed");
-    }
 
     let code = exit_code(status);
     let mut record = sess.record;
@@ -186,11 +203,12 @@ fn run(command: &str) -> Result<i32> {
 }
 
 fn diff_cmd(porcelain: bool) -> Result<i32> {
-    let backend = backend::select()?;
-    let state = state::state_dir()?;
-    let sess = pending_session(&state)?;
-    ensure_not_stale(&sess)?;
-    let changes = backend.changes(&sandbox_of(&sess.record))?;
+    let roots = StateRoots::load()?;
+    let sess = pending_session(&roots)?;
+    let backend = backend::for_record(&sess.record)?;
+    let sandbox = backend::sandbox_of(&sess.dir, &sess.record)?;
+    ensure_not_stale(backend.as_ref(), &sandbox, &sess)?;
+    let changes = backend.changes(&sandbox)?;
     if porcelain {
         print!("{}", diff::render_porcelain(&changes));
     } else {
@@ -202,10 +220,15 @@ fn diff_cmd(porcelain: bool) -> Result<i32> {
 }
 
 fn undo() -> Result<i32> {
-    let state = state::state_dir()?;
-    let sess = pending_session(&state)?;
-    // O(1) critical section: one rename into trash. Deletion is async.
-    session::move_to_trash(&state, &sess.dir)?;
+    let roots = StateRoots::load()?;
+    let sess = pending_session(&roots)?;
+    let backend = backend::for_record(&sess.record)?;
+    let sandbox = backend::sandbox_of(&sess.dir, &sess.record)?;
+    // Target-side restore first (no-op for interception backends; the
+    // identity-checked three-branch restore for snapshot-restore). Only
+    // then is the session consumed — O(1) rename into trash + async gc.
+    backend.restore(&sandbox)?;
+    session::move_to_trash(&roots, &sess.root, &sess.dir)?;
     session::spawn_background_gc();
     eprintln!(
         "oops: undone 💨 (discarded the sandbox from `oops run \"{}\"`)",
@@ -215,13 +238,14 @@ fn undo() -> Result<i32> {
 }
 
 fn commit() -> Result<i32> {
-    let backend = backend::select()?;
-    let state = state::state_dir()?;
-    let sess = pending_session(&state)?;
-    ensure_not_stale(&sess)
-        .context("refusing to commit a stale sandbox (`oops undo` cleans it up)")?;
-    backend.merge(&sandbox_of(&sess.record))?;
-    session::move_to_trash(&state, &sess.dir)?;
+    let roots = StateRoots::load()?;
+    let sess = pending_session(&roots)?;
+    let backend = backend::for_record(&sess.record)?;
+    let sandbox = backend::sandbox_of(&sess.dir, &sess.record)?;
+    ensure_not_stale(backend.as_ref(), &sandbox, &sess)
+        .context("refusing to commit a stale sandbox")?;
+    backend.merge(&sandbox)?;
+    session::move_to_trash(&roots, &sess.root, &sess.dir)?;
     session::spawn_background_gc();
     eprintln!(
         "oops: committed `oops run \"{}\"` to the real files.",
@@ -230,22 +254,18 @@ fn commit() -> Result<i32> {
     Ok(0)
 }
 
-/// A session whose upper layer is gone (e.g. state on tmpfs across a
-/// reboot) can still be undone, but must not be diffed or committed.
-fn ensure_not_stale(sess: &session::Session) -> Result<()> {
-    if !sess.record.upper.is_dir() {
+fn ensure_not_stale(
+    backend: &dyn backend::SnapshotBackend,
+    sandbox: &backend::Sandbox,
+    sess: &session::Session,
+) -> Result<()> {
+    if backend.is_stale(sandbox) {
         bail!(
-            "the sandbox layers for {} are gone (stale session, e.g. after a reboot)",
+            "the sandbox state for {} is gone (stale session)",
             sess.record.target.display()
         );
     }
     Ok(())
-}
-
-fn discard_session(state: &Path, dir: &Path) {
-    if session::move_to_trash(state, dir).is_ok() {
-        session::spawn_background_gc();
-    }
 }
 
 #[cfg(unix)]

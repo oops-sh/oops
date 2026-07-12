@@ -11,7 +11,7 @@ DOCKER_RUN   := docker run --rm --privileged \
 	-v oops-target-linux:/oops/target \
 	$(DOCKER_IMAGE)
 
-.PHONY: docker-image test-linux bench-linux demo-gif shell-linux check test
+.PHONY: docker-image test-linux bench-linux test-apfs bench-apfs demo-gif shell-linux check test
 
 docker-image:
 	docker build -t $(DOCKER_IMAGE) docker
@@ -24,6 +24,15 @@ test-linux: docker-image
 # The undo performance benchmark (< 100ms on a ~10k-file tree).
 bench-linux: docker-image
 	$(DOCKER_RUN) cargo test --release bench_undo -- --ignored --nocapture
+
+# APFS backend tests: destructive but triple-gated (self-created tempdirs,
+# per-test XDG_STATE_HOME override, and this explicit flag). macOS host only.
+test-apfs:
+	OOPS_TEST_DESTRUCTIVE=1 cargo test
+
+# The APFS undo benchmark (< 100ms on a ~10k-file tree) + setup cost report.
+bench-apfs:
+	OOPS_TEST_DESTRUCTIVE=1 cargo test --release bench_undo_apfs -- --ignored --nocapture
 
 # Re-render demo/demo.gif from demo/demo.tape (spec: must stay <= 3 MB).
 demo-gif: docker-image

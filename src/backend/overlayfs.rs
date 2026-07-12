@@ -17,59 +17,93 @@ use std::process::ExitStatus;
 
 use anyhow::{bail, Context, Result};
 
-use super::{validate_mount_path, Change, ChangeKind, Sandbox, SnapshotBackend};
+use super::{validate_mount_path, Change, ChangeKind, Layers, Sandbox, SnapshotBackend};
 
 pub struct OverlayFs;
 
+fn layers(sandbox: &Sandbox) -> Result<(&PathBuf, &PathBuf)> {
+    match &sandbox.layers {
+        Layers::Overlay { upper, work } => Ok((upper, work)),
+        _ => anyhow::bail!("overlayfs backend given a non-overlay session"),
+    }
+}
+
+fn marker_path(sandbox: &Sandbox) -> PathBuf {
+    // In the session directory: outside any layer, inside oops state.
+    sandbox.session_dir.join("started")
+}
+
 impl SnapshotBackend for OverlayFs {
     fn exec(&self, sandbox: &Sandbox, command: &str) -> Result<ExitStatus> {
-        for p in [&sandbox.target, &sandbox.upper, &sandbox.work] {
+        let (upper, work) = layers(sandbox)?;
+        for p in [&sandbox.target, upper, work] {
             validate_mount_path(p)?;
         }
+        let marker = marker_path(sandbox);
         let exe = std::env::current_exe().context("cannot locate the oops binary for re-exec")?;
         let status = std::process::Command::new(exe)
             .arg("__exec")
             .arg("--target")
             .arg(&sandbox.target)
             .arg("--upper")
-            .arg(&sandbox.upper)
+            .arg(upper)
             .arg("--work")
-            .arg(&sandbox.work)
+            .arg(work)
             .arg("--marker")
-            .arg(super::marker_path(sandbox))
+            .arg(&marker)
             .arg("--")
             .arg(command)
             .status()
             .context("failed to spawn the sandbox child process")?;
+        // Contract: Err ⇒ the command never executed. The child writes the
+        // marker only after the sandbox is fully set up, immediately before
+        // exec'ing the command — no marker means setup failed.
+        if !marker.exists() {
+            anyhow::bail!(
+                "sandbox setup failed (see the message above); the command was NOT executed"
+            );
+        }
         Ok(status)
     }
 
     fn changes(&self, sandbox: &Sandbox) -> Result<Vec<Change>> {
+        let (upper, _) = layers(sandbox)?;
         let mut out = Vec::new();
-        walk_changes(
-            &sandbox.upper,
-            &sandbox.target,
-            true,
-            &PathBuf::new(),
-            &mut out,
-        )?;
+        walk_changes(upper, &sandbox.target, true, &PathBuf::new(), &mut out)?;
         super::sort_changes(&mut out);
         Ok(out)
     }
 
+    fn restore(&self, _sandbox: &Sandbox) -> Result<()> {
+        // Interception: the real tree was never touched; discarding the
+        // layer (done by the caller via trash) is the whole undo.
+        Ok(())
+    }
+
     fn merge(&self, sandbox: &Sandbox) -> Result<()> {
+        let (upper, _) = layers(sandbox)?;
         // Phase A: validate the whole upper layer before touching the real
         // tree. Any overlay xattr we do not recognize aborts the commit.
-        let total = validate_upper(&sandbox.upper)?;
+        let total = validate_upper(upper)?;
         // Phase B: fail-stop, idempotent replay.
         let mut applied = 0usize;
-        replay(&sandbox.upper, &sandbox.target, &mut applied).map_err(|e| {
+        replay(upper, &sandbox.target, &mut applied).map_err(|e| {
             e.context(format!(
                 "commit stopped after applying {applied} of {total} entries; \
                  the session is preserved — fix the cause and re-run `oops commit`"
             ))
         })?;
         Ok(())
+    }
+
+    fn is_stale(&self, sandbox: &Sandbox) -> bool {
+        layers(sandbox)
+            .map(|(upper, _)| !upper.is_dir())
+            .unwrap_or(true)
+    }
+
+    fn kind(&self) -> crate::session::BackendKind {
+        crate::session::BackendKind::Overlayfs
     }
 }
 

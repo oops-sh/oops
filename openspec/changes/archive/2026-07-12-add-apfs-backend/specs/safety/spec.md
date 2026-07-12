@@ -1,33 +1,11 @@
-# safety Specification
+# safety — delta for add-apfs-backend
 
-## Purpose
-TBD - created by archiving change add-core-sandbox-loop. Update Purpose after archive.
-## Requirements
-### Requirement: Fail-closed sandboxing
-oops MUST never make things less safe than not using it. If sandbox setup
-fails for any reason (unsupported platform, mount failure, missing
-privileges, backend error), `oops run` MUST refuse to execute the command
-and exit non-zero. It MUST NOT fall back to running the command unsandboxed.
+> **REVIEW FLAG:** the two MODIFIED requirements below — "Undo containment"
+> and "Destructive tests are container-only" — change the project's core
+> invariants (wording revised per review 2026-07-12: parent-anchored
+> identity, three explicit restore branches, triple-gated host tests).
 
-#### Scenario: OverlayFS mount fails
-- **WHEN** `oops run "touch x"` is invoked and the OverlayFS mount cannot be created
-- **THEN** the command `touch x` is never executed, `x` does not exist, and oops exits non-zero with an error explaining the sandbox failure
-
-#### Scenario: Unsupported platform
-- **WHEN** `oops run "touch x"` is invoked on a platform with no working SnapshotBackend (e.g. macOS in Phase 0)
-- **THEN** the command is never executed and oops exits non-zero with a message directing the user to a supported environment
-
-### Requirement: Honest guarantee boundary
-The undo guarantee is filesystem-only and target-tree-only: it covers writes
-under the single directory tree sandboxed by `oops run` (the invocation
-working directory). Writes outside that tree, network side effects, spawned
-processes/daemons, and any non-filesystem state are NOT covered. oops MUST
-state this boundary in user-facing documentation (README, `run` help text)
-and MUST NOT claim or imply undo coverage beyond it.
-
-#### Scenario: Command writes outside the target tree
-- **WHEN** `oops run "touch /tmp/outside"` completes and `oops undo` is invoked
-- **THEN** `/tmp/outside` still exists — and this behavior is documented as the guarantee boundary, not a bug
+## MODIFIED Requirements
 
 ### Requirement: Undo containment
 `oops undo` MUST modify exactly two things and nothing else:
@@ -91,16 +69,6 @@ a layer) automatically satisfy clause 1 by doing nothing to the target.
 - **WHEN** the parent directory of the recorded target no longer matches the recorded device and inode and `oops undo` is invoked
 - **THEN** oops refuses the restore, modifies nothing, and exits non-zero explaining the identity mismatch
 
-### Requirement: Single state directory
-All persistent oops state (session records, upper layers, work directories,
-mount points) MUST live under one well-known directory:
-`$XDG_STATE_HOME/oops/`, defaulting to `~/.local/state/oops/`. Deleting that
-directory (when nothing is mounted) MUST fully reset oops.
-
-#### Scenario: State is inspectable and nukeable
-- **WHEN** a user removes `~/.local/state/oops/` while no sandbox mount is active
-- **THEN** oops behaves as if freshly installed, and no oops artifacts remain anywhere else on the filesystem
-
 ### Requirement: Destructive tests are container-only
 Destructive integration tests MUST create and touch only their own
 dedicated temporary trees; they MUST never operate on pre-existing
@@ -130,6 +98,8 @@ developer files. In addition, per backend:
 - **WHEN** the APFS destructive suite runs with all three gates satisfied
 - **THEN** every path it modifies lies inside its own temporary directories and its test-scoped state root, and the developer's real state root is untouched
 
+## ADDED Requirements
+
 ### Requirement: Snapshot-restore fine print
 For backends using the snapshot-restore model (APFS), user-facing
 documentation MUST state, in addition to the existing guarantee boundary:
@@ -149,4 +119,3 @@ after restart restores it.
 #### Scenario: Crash inside the window is recoverable
 - **WHEN** oops or the machine crashes after `oops run` mutated the real tree but before undo/commit, and the user later runs `oops undo`
 - **THEN** the target subtree is restored from the persisted snapshot
-
