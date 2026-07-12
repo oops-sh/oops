@@ -1,0 +1,34 @@
+schema: spec-driven
+
+context: |
+  oops — a command-line safety layer whose core promise is: any command can be undone.
+  Flagship demo: `oops run "rm -rf ./project"` then `oops undo` → files are back.
+
+  Tech stack: Rust (binary + crate name `oops`). Phase 0 sandbox backend is
+  OverlayFS on Linux; the snapshot backend is a trait (`SnapshotBackend`) with
+  `overlayfs` first and `apfs` planned later. Dev host is macOS; everything
+  touching OverlayFS runs inside a Docker container (`make test-linux`).
+
+  Product skeleton is exactly four verbs: run / diff / undo / commit.
+  No TUI, no PTY, no rendering in Phase 0-1 — pure CLI wrapper.
+
+  Specs are organized by capability: cli/, sandbox/, diff/, session/, safety/.
+
+  Safety invariants (non-negotiable):
+  - If sandbox setup fails, refuse to run the command — never fall through to
+    running it unsandboxed.
+  - `undo` must never delete anything outside oops-managed state directories.
+  - Destructive integration tests run only inside the container, never on the host.
+  - All oops state lives under a single well-known directory
+    (~/.local/state/oops/ in-container).
+
+  Conventions: conventional commits (feat:/fix:/spec:), small PR-sized changes,
+  specs and code comments in English. The `reference/` folder (Ghostty, cmux)
+  is read-only research material — never build against it, never copy from it
+  (cmux is GPL-3.0).
+
+rules:
+  proposal:
+    - Include a "Non-goals" section that lists deferred scope explicitly
+  tasks:
+    - Keep tasks small; one change ≈ one reviewable PR-sized unit
