@@ -2,15 +2,17 @@
 # Crate name vs command name: the crates.io name `oops` is squatted, so the
 # crate is `oops-sh` while the installed binary stays `oops` (see [[bin]]).
 name = "oops-sh"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Undo for your terminal: run any command in a sandbox, then undo or commit it. Installs the `oops` binary (runtime is Linux-only for now; other platforms refuse to run rather than run unsandboxed)."
+description = "Undo for your terminal: run any command in a sandbox, then undo or commit it. Installs the `oops` binary (Linux via OverlayFS, macOS via APFS snapshots; other platforms refuse to run rather than run unsandboxed)."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/oops-sh/oops"
 readme = "README.md"
 keywords = ["undo", "sandbox", "cli", "safety", "overlayfs"]
 categories = ["command-line-utilities", "development-tools", "filesystem"]
-include = ["src/**", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
+# Anchored: cargo include globs use gitignore semantics, so an unanchored
+# `README.md` would also pull in nested ones (e.g. spikes/apfs/README.md).
+include = ["/src/**", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
 
 [[bin]]
 name = "oops"
