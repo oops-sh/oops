@@ -1,0 +1,13 @@
+# Reference source code (Ghostty, cmux) — read-only research material, not part of the build
+reference/
+
+# Rust
+target/
+
+# macOS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+*.swp

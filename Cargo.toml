@@ -1,0 +1,9 @@
+[package]
+name = "oops"
+version = "0.0.1"
+edition = "2021"
+description = "Undo for your terminal. Any command can be undone."
+license = "MIT"
+repository = "https://github.com/oops-sh/oops"
+
+[dependencies]
