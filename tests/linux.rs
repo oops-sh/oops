@@ -151,8 +151,9 @@ fn flagship_demo_rm_rf_then_undo() {
     run_ok(&t, "rm -rf testdir");
     assert_eq!(manifest(&t), before, "rm -rf must not touch the real tree");
 
-    // The deletion is visible in the diff (whiteout in the upper layer).
-    let out = oops_in(&t, &["diff"]);
+    // The deletion is visible in the diff (whiteout in the upper layer),
+    // as a single non-expanded entry per the porcelain contract.
+    let out = oops_in(&t, &["diff", "--porcelain"]);
     assert!(out.status.success());
     assert_eq!(stdout(&out), "D testdir/\n");
 
@@ -193,17 +194,51 @@ fn diff_classifies_mixed_changes_sorted() {
 
     run_ok(&t, "echo x > n && echo more >> m && rm d");
 
-    let out = oops_in(&t, &["diff"]);
+    let out = oops_in(&t, &["diff", "--porcelain"]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(
         stdout(&out),
         "D d\nM m\nA n\n",
-        "sorted by path, A/M/D classified"
+        "byte-order sorted, A/M/D classified"
     );
 
     // diff is read-only and repeatable.
-    let again = oops_in(&t, &["diff"]);
+    let again = oops_in(&t, &["diff", "--porcelain"]);
     assert_eq!(stdout(&again), "D d\nM m\nA n\n");
+
+    // Human mode: grouped sections with counts and a summary; piped stdout
+    // means no ANSI escape codes.
+    let human = oops_in(&t, &["diff"]);
+    assert!(human.status.success(), "{}", stderr(&human));
+    assert_eq!(
+        stdout(&human),
+        "Created (1)\n  n\n\nModified (1)\n  m\n\nDeleted (1)\n  d\n\n\
+         1 created, 1 modified, 1 deleted\n"
+    );
+    assert!(
+        !stdout(&human).contains('\x1b'),
+        "piped output must not be colored"
+    );
+
+    oops_in(&t, &["undo"]);
+}
+
+#[test]
+fn empty_diff_semantics() {
+    container_only!();
+    let target = make_target();
+    let t = target.path().canonicalize().unwrap();
+
+    run_ok(&t, "true");
+
+    // Human mode says so explicitly; porcelain stays empty. Both exit 0.
+    let human = oops_in(&t, &["diff"]);
+    assert!(human.status.success());
+    assert_eq!(stdout(&human), "no changes\n");
+
+    let porcelain = oops_in(&t, &["diff", "--porcelain"]);
+    assert!(porcelain.status.success());
+    assert_eq!(stdout(&porcelain), "");
 
     oops_in(&t, &["undo"]);
 }

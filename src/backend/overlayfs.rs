@@ -53,7 +53,7 @@ impl SnapshotBackend for OverlayFs {
             &PathBuf::new(),
             &mut out,
         )?;
-        out.sort_by(|a, b| a.path.cmp(&b.path));
+        super::sort_changes(&mut out);
         Ok(out)
     }
 

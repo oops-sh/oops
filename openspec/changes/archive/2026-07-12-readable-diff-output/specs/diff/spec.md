@@ -1,8 +1,7 @@
-# diff Specification
+# diff — delta for readable-diff-output
 
-## Purpose
-TBD - created by archiving change add-core-sandbox-loop. Update Purpose after archive.
-## Requirements
+## MODIFIED Requirements
+
 ### Requirement: Change classification
 `oops diff` MUST walk the pending sandbox's upper layer and classify every
 changed path as created, modified, or deleted, relative to the lower layer:
@@ -33,14 +32,7 @@ between versions. The frozen contract includes:
 - **WHEN** the wrapped command removed directory `sub/` containing files
 - **THEN** `oops diff --porcelain` reports exactly one line `D sub/` and no lines for its former contents
 
-### Requirement: Diff is read-only
-`oops diff` MUST NOT modify the upper layer, the lower layer, or the session
-record. Running it any number of times MUST leave the pending sandbox
-byte-identical.
-
-#### Scenario: Diff twice
-- **WHEN** `oops diff` is run twice in a row
-- **THEN** both runs produce identical output and the sandbox state is unchanged
+## ADDED Requirements
 
 ### Requirement: Human-readable default output
 Without `--porcelain`, `oops diff` MUST group changes into three sections in
@@ -94,4 +86,3 @@ be used for anything else.
 #### Scenario: Reserved flag is not squatted
 - **WHEN** any future change adds a short flag to `oops diff`
 - **THEN** `-z` is either the NUL-terminated output variant or still unused
-
