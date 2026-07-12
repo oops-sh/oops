@@ -9,4 +9,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     util-linux \
     && rm -rf /var/lib/apt/lists/*
 
+# Marks the destructive-test environment: the integration tests refuse to
+# run their filesystem-mangling scenarios unless this is set (safety spec).
+ENV OOPS_TEST_CONTAINER=1
+
 WORKDIR /oops
