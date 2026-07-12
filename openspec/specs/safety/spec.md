@@ -1,10 +1,8 @@
-# safety — non-negotiable invariants
+# safety Specification
 
-Every other capability defers to this spec. When a requirement here conflicts
-with convenience, performance, or UX anywhere else, this spec wins.
-
-## ADDED Requirements
-
+## Purpose
+TBD - created by archiving change add-core-sandbox-loop. Update Purpose after archive.
+## Requirements
 ### Requirement: Fail-closed sandboxing
 oops MUST never make things less safe than not using it. If sandbox setup
 fails for any reason (unsupported platform, mount failure, missing
@@ -19,10 +17,23 @@ and exit non-zero. It MUST NOT fall back to running the command unsandboxed.
 - **WHEN** `oops run "touch x"` is invoked on a platform with no working SnapshotBackend (e.g. macOS in Phase 0)
 - **THEN** the command is never executed and oops exits non-zero with a message directing the user to a supported environment
 
+### Requirement: Honest guarantee boundary
+The undo guarantee is filesystem-only and target-tree-only: it covers writes
+under the single directory tree sandboxed by `oops run` (the invocation
+working directory). Writes outside that tree, network side effects, spawned
+processes/daemons, and any non-filesystem state are NOT covered. oops MUST
+state this boundary in user-facing documentation (README, `run` help text)
+and MUST NOT claim or imply undo coverage beyond it.
+
+#### Scenario: Command writes outside the target tree
+- **WHEN** `oops run "touch /tmp/outside"` completes and `oops undo` is invoked
+- **THEN** `/tmp/outside` still exists — and this behavior is documented as the guarantee boundary, not a bug
+
 ### Requirement: Undo containment
-`oops undo` MUST only delete or modify paths inside oops-managed state
-directories. It MUST NOT remove, truncate, or rewrite any path outside them,
-regardless of session-state corruption or invalid input.
+`oops undo` — including its asynchronous deletion phase — and gc MUST only
+delete or modify paths inside oops-managed state directories. They MUST NOT
+remove, truncate, or rewrite any path outside them, regardless of
+session-state corruption or invalid input.
 
 #### Scenario: Corrupted session state points outside the state directory
 - **WHEN** the pending-session record names an upper-layer path outside the oops state directory and `oops undo` is invoked
@@ -50,3 +61,4 @@ against a developer's host filesystem.
 #### Scenario: Destructive test invoked on the host
 - **WHEN** the destructive integration test suite is run outside the container guard (e.g. plain `cargo test` on the dev host)
 - **THEN** the destructive tests are skipped or refuse to run; no host paths are touched
+

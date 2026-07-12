@@ -7,3 +7,18 @@ license = "MIT"
 repository = "https://github.com/oops-sh/oops"
 
 [dependencies]
+anyhow = "1.0.103"
+clap = { version = "4.6.1", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.186"
+nix = { version = "0.31.3", features = ["mount", "sched", "fs"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2.186"
+
+[dev-dependencies]
+serde_json = "1.0.150"
+tempfile = "3.27.0"

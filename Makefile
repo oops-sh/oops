@@ -11,7 +11,7 @@ DOCKER_RUN   := docker run --rm --privileged \
 	-v oops-target-linux:/oops/target \
 	$(DOCKER_IMAGE)
 
-.PHONY: docker-image test-linux shell-linux check test
+.PHONY: docker-image test-linux bench-linux shell-linux check test
 
 docker-image:
 	docker build -t $(DOCKER_IMAGE) docker
@@ -20,6 +20,10 @@ docker-image:
 # --privileged is required for mount(2); tests never touch the host filesystem.
 test-linux: docker-image
 	$(DOCKER_RUN) cargo test
+
+# The undo performance benchmark (< 100ms on a ~10k-file tree).
+bench-linux: docker-image
+	$(DOCKER_RUN) cargo test --release bench_undo -- --ignored --nocapture
 
 # Interactive shell inside the Linux test environment.
 shell-linux: docker-image
