@@ -81,10 +81,13 @@ APFS benchmark runs on a macOS host.
 ### Requirement: APFS snapshot-restore backend
 On the apfs backend, `run` MUST take a `clonefile(2)` snapshot of the
 target tree into a registered state root **before** the command starts,
-record the target's identity (canonical path, `st_dev`, `st_ino`), and
-then execute the command against the real tree. `undo` MUST restore by
-atomically swapping the snapshot with the target
-(`renamex_np(RENAME_SWAP)`) only after re-verifying the recorded identity.
+record the target's canonical path and its **parent directory's** identity
+(`st_dev`, `st_ino`), and then execute the command against the real tree.
+`undo` MUST restore only after re-verifying the recorded parent identity,
+following the three branches defined in the safety spec's undo-containment
+requirement (existing non-symlink target → `renamex_np(RENAME_SWAP)`;
+missing target → rename the snapshot into the verified parent; symlink
+target → refuse).
 The snapshot and the target MUST be on the same volume; if the clone
 cannot be created (cross-volume, ENOSPC, non-APFS filesystem), `run` MUST
 refuse to execute the command (fail closed). Cloning is not atomic against

@@ -1,20 +1,31 @@
 # safety — delta for add-apfs-backend
 
-> **REVIEW FLAG (逐字審查):** the two MODIFIED requirements below — "Undo
-> containment" and "Destructive tests are container-only" — change the
-> project's core invariants. Please review them word by word; the rest of
-> this delta is additive fine print.
+> **REVIEW FLAG:** the two MODIFIED requirements below — "Undo containment"
+> and "Destructive tests are container-only" — change the project's core
+> invariants (wording revised per review 2026-07-12: parent-anchored
+> identity, three explicit restore branches, triple-gated host tests).
 
 ## MODIFIED Requirements
 
 ### Requirement: Undo containment
 `oops undo` MUST modify exactly two things and nothing else:
 
-1. **The session's protected target subtree** — restoring it, atomically,
-   to its recorded snapshot state. Before any restore operation, the target
-   MUST be re-verified against the identity recorded at `run` time
-   (canonical path plus `st_dev` and `st_ino`); on mismatch, undo refuses
-   and modifies nothing.
+1. **The session's protected target subtree** — restoring it to its
+   recorded snapshot state. The restore is anchored on the **parent
+   directory**: at `run` time the session records the parent's `st_dev`
+   and `st_ino` plus the target's canonical path; at undo time the parent
+   MUST be re-verified against that identity, and on mismatch undo refuses
+   and modifies nothing. Within a verified parent, the restore has exactly
+   three branches, decided by `lstat` of the target path:
+   - **Target exists and is not a symlink** (same inode or a different
+     one — a replaced target is treated as just another change the command
+     made): restore proceeds normally via the atomic swap.
+   - **Target does not exist** (the command deleted it): restore proceeds
+     by renaming the snapshot into the verified parent at the recorded
+     name.
+   - **Target is a symlink**: undo refuses and modifies nothing — a
+     symlink at the target path could redirect the restore outside the
+     protected scope.
 2. **Registered oops state roots** — deletions and renames by undo
    (including its asynchronous deletion phase) and by gc are permitted only
    for paths that a containment check proves to be inside one of the
@@ -23,9 +34,12 @@
 
 Regardless of session-state corruption or invalid input, undo and gc MUST
 NOT remove, truncate, rewrite, or swap any other path on the system.
-Backends that never modify the target during undo (e.g. OverlayFS, which
-discards a layer) automatically satisfy clause 1 by doing nothing to the
-target.
+After a snapshot-restore undo, the displaced tree (the state the command
+left behind) sits in a state root's trash awaiting asynchronous deletion:
+it is not diffable, not recoverable through any oops command, and the
+session is consumed — `oops diff` reports no pending sandbox. Backends
+that never modify the target during undo (e.g. OverlayFS, which discards
+a layer) automatically satisfy clause 1 by doing nothing to the target.
 
 #### Scenario: Corrupted session state points outside the state roots
 - **WHEN** the pending-session record names a snapshot or layer path outside every registered state root and `oops undo` is invoked
@@ -36,11 +50,23 @@ target.
 - **THEN** the only paths removed are the sandbox's layers and session record, all inside a registered state root; the target is not modified
 
 #### Scenario: Normal undo (snapshot-restore backend)
-- **WHEN** `oops undo` runs against a valid pending APFS session
-- **THEN** the target subtree is atomically restored to its snapshot state, the displaced tree and session record end up inside a registered state root for deletion, and no path outside the target subtree and the state roots is touched
+- **WHEN** `oops undo` runs against a valid pending APFS session whose target still exists as a directory
+- **THEN** the target subtree is atomically swapped back to its snapshot state, the displaced tree and session record end up inside a registered state root for deletion, and no path outside the target subtree and the state roots is touched
 
-#### Scenario: Target identity changed since run
-- **WHEN** the directory at the recorded target path no longer matches the recorded device and inode (e.g. it was deleted and recreated) and `oops undo` is invoked
+#### Scenario: Target was replaced by the command
+- **WHEN** the wrapped command deleted and recreated the target directory (different inode, same path) and `oops undo` is invoked
+- **THEN** the parent identity still verifies, the replacement is treated as part of the command's changes, and the restore proceeds normally
+
+#### Scenario: Target was deleted by the command
+- **WHEN** the target path no longer exists and `oops undo` is invoked
+- **THEN** the snapshot is renamed into the verified parent at the recorded name, restoring the tree
+
+#### Scenario: Target is a symlink at undo time
+- **WHEN** the target path is a symlink and `oops undo` is invoked
+- **THEN** undo refuses, modifies nothing, and exits non-zero explaining the symlink hazard
+
+#### Scenario: Parent identity changed since run
+- **WHEN** the parent directory of the recorded target no longer matches the recorded device and inode and `oops undo` is invoked
 - **THEN** oops refuses the restore, modifies nothing, and exits non-zero explaining the identity mismatch
 
 ### Requirement: Destructive tests are container-only
@@ -51,18 +77,25 @@ developer files. In addition, per backend:
 - The **OverlayFS suite** (mounts, namespaces) MUST run only inside the
   Linux test container, guarded by the container marker, and MUST be
   skipped elsewhere.
-- The **APFS suite** runs on a macOS host (there is no container for APFS)
-  but MUST confine every path it creates, mutates, restores, or deletes to
-  freshly created temporary directories and a test-scoped state root
-  (`XDG_STATE_HOME` pointed at a temp dir), never the developer's real
-  state root or working files.
+- The **APFS suite** runs on a macOS host (there is no container for
+  APFS) behind a **triple gate**, all three required or the tests skip:
+  1. an explicit state-root override — every test points
+     `XDG_STATE_HOME` at a temp directory it created, so the developer's
+     real state root is never involved;
+  2. self-created temp directories for every target tree it mutates;
+  3. the environment variable `OOPS_TEST_DESTRUCTIVE=1`, set by the
+     dedicated make target, never by default.
 
 #### Scenario: Destructive test invoked on the host
 - **WHEN** the OverlayFS destructive suite is run outside the container guard (e.g. plain `cargo test` on the dev host)
 - **THEN** those tests are skipped or refuse to run; no host paths are touched
 
+#### Scenario: APFS suite without the destructive flag
+- **WHEN** the APFS suite runs without `OOPS_TEST_DESTRUCTIVE=1` (e.g. plain `cargo test` on the dev host)
+- **THEN** every destructive test skips; no paths are touched
+
 #### Scenario: APFS suite is tempdir-confined
-- **WHEN** the APFS destructive suite runs on a macOS host
+- **WHEN** the APFS destructive suite runs with all three gates satisfied
 - **THEN** every path it modifies lies inside its own temporary directories and its test-scoped state root, and the developer's real state root is untouched
 
 ## ADDED Requirements

@@ -5,8 +5,9 @@
 ### Requirement: Durable, inspectable session records
 Session records MUST be stored as human-readable JSON under a registered
 oops state root, keyed by target directory. Records MUST name the backend
-that created them, the target's identity (canonical path, `st_dev`,
-`st_ino`), and MUST contain only paths inside registered state roots as
+that created them, the target's canonical path, the target parent
+directory's identity (`st_dev`, `st_ino`), and MUST contain only paths
+inside registered state roots as
 deletable state (per safety's undo containment; the target path itself is
 restorable, not deletable).
 
@@ -88,8 +89,9 @@ target on the same volume, a target on a different volume than the primary
 root uses a per-volume state root at `<volume-mount>/.oops/state/` with the
 identical layout (`sessions/`, `trash/`). Every per-volume root MUST be
 recorded, at creation time, in a registry (`volumes.json`) under the
-primary root; containment checks and gc operate over exactly the
-registered set. If the per-volume root cannot be created (read-only
+primary root; registry writes MUST be atomic (write to a temporary file,
+then rename into place), so a crash can never leave a truncated registry.
+Containment checks and gc operate over exactly the registered set. If the per-volume root cannot be created (read-only
 volume, permissions), `run` MUST refuse (fail closed). Deleting a volume's
 `.oops/` (plus the registry entry) MUST fully reset oops for that volume.
 
