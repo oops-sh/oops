@@ -102,3 +102,16 @@ volume, permissions), `run` MUST refuse (fail closed). Deleting a volume's
 #### Scenario: Read-only volume fails closed
 - **WHEN** the target's volume cannot host a state root (e.g. read-only)
 - **THEN** the command is never executed and oops exits non-zero explaining why
+
+### Requirement: Session lookup by logical path fallback
+Sessions are looked up by the canonicalized working directory. If the
+working directory cannot be resolved or matches no session — the expected
+state after the wrapped command deleted or replaced the target directory
+itself — lookup MUST fall back to the shell's logical `$PWD`, compared
+against recorded target paths. This is what makes the deleted-target and
+symlink restore branches reachable from a shell still sitting in the
+damaged location.
+
+#### Scenario: Undo from a deleted cwd
+- **WHEN** the wrapped command deleted the target directory and the user runs `oops undo` from a shell whose `$PWD` still names it
+- **THEN** the session is found via the `$PWD` fallback and the restore proceeds per the safety spec's branches

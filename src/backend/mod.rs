@@ -1,6 +1,12 @@
-//! The snapshot backend abstraction. OverlayFS (Linux) is the Phase 0
-//! implementation; an APFS backend is planned. See openspec/specs/sandbox.
+//! The snapshot backend abstraction. Two models:
+//! - **interception** (OverlayFS, Linux): the command's writes land in a
+//!   layer and never touch the real tree;
+//! - **snapshot-restore** (APFS, macOS): the real tree is mutated and can
+//!   be atomically restored from a clonefile snapshot.
+//! See openspec/specs/sandbox.
 
+#[cfg(target_os = "macos")]
+pub mod apfs;
 #[cfg(target_os = "linux")]
 pub mod overlayfs;
 
@@ -9,11 +15,26 @@ use std::process::ExitStatus;
 
 use anyhow::Result;
 
-/// Paths of one pending sandbox, as recorded in the session.
+use crate::session::SessionRecord;
+
+/// One pending sandbox, reconstructed from a session record.
 pub struct Sandbox {
     pub target: PathBuf,
-    pub upper: PathBuf,
-    pub work: PathBuf,
+    pub session_dir: PathBuf,
+    pub layers: Layers,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub enum Layers {
+    Overlay {
+        upper: PathBuf,
+        work: PathBuf,
+    },
+    Snapshot {
+        snapshot: PathBuf,
+        parent_dev: u64,
+        parent_ino: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -43,18 +64,29 @@ pub struct Change {
 }
 
 pub trait SnapshotBackend {
-    /// Run `command` (via `sh -c`) with all filesystem writes to
-    /// `sandbox.target` redirected into the upper layer. Must not execute
-    /// the command at all if sandbox setup fails (safety: fail closed).
+    /// Run `command` (via `sh -c`) under this backend's protection model.
+    /// Contract: an `Err` means the command was never executed (fail
+    /// closed); `Ok(status)` means it ran and exited with `status`.
     fn exec(&self, sandbox: &Sandbox, command: &str) -> Result<ExitStatus>;
 
-    /// Classify the upper layer into created/modified/deleted paths.
-    /// Read-only: must not mutate any layer.
+    /// Classify the pending changes into created/modified/deleted paths.
+    /// Read-only: must not mutate the target, any layer, or the session.
     fn changes(&self, sandbox: &Sandbox) -> Result<Vec<Change>>;
 
-    /// Apply the upper layer to the real tree. Fail-stop and idempotent:
-    /// on error, stop and leave both layers so a retry can complete.
+    /// Undo's target-side work. Interception backends do nothing (the
+    /// layer discard is the undo). Snapshot-restore backends restore the
+    /// target per the safety spec's three branches.
+    fn restore(&self, sandbox: &Sandbox) -> Result<()>;
+
+    /// Commit's target-side work. OverlayFS replays the layer;
+    /// snapshot-restore backends do nothing (the tree already has the
+    /// changes).
     fn merge(&self, sandbox: &Sandbox) -> Result<()>;
+
+    /// True if the sandbox's backing state is unusable (stale session).
+    fn is_stale(&self, sandbox: &Sandbox) -> bool;
+
+    fn kind(&self) -> crate::session::BackendKind;
 }
 
 /// Select the backend for this platform, failing closed when there is none.
@@ -63,21 +95,65 @@ pub fn select() -> Result<Box<dyn SnapshotBackend>> {
     {
         Ok(Box::new(overlayfs::OverlayFs))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Box::new(apfs::Apfs))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         anyhow::bail!(
-            "no snapshot backend supports this platform yet (OverlayFS is Linux-only; \
-             an APFS backend is planned).\n\
-             Refusing to run the command unsandboxed. On macOS, use the Linux dev \
-             container: `make shell-linux`."
+            "no snapshot backend supports this platform yet (OverlayFS on Linux, \
+             APFS on macOS).\nRefusing to run the command unsandboxed."
         )
     }
 }
 
-/// True when running inside the oops Linux test container (set by
-/// docker/Dockerfile). Destructive integration tests refuse to run without it.
-pub fn in_test_container() -> bool {
-    std::env::var_os("OOPS_TEST_CONTAINER").is_some()
+/// The backend that created an existing session, by record name. Errors if
+/// that backend is not available on this platform.
+pub fn for_record(record: &SessionRecord) -> Result<Box<dyn SnapshotBackend>> {
+    match record.backend.as_str() {
+        #[cfg(target_os = "linux")]
+        "overlayfs" => Ok(Box::new(overlayfs::OverlayFs)),
+        #[cfg(target_os = "macos")]
+        "apfs" => Ok(Box::new(apfs::Apfs)),
+        other => anyhow::bail!(
+            "session was created by the `{other}` backend, which is not available on this platform"
+        ),
+    }
+}
+
+/// Reconstruct a Sandbox from a session record.
+pub fn sandbox_of(session_dir: &Path, record: &SessionRecord) -> Result<Sandbox> {
+    let layers = match record.backend.as_str() {
+        "overlayfs" => Layers::Overlay {
+            upper: record
+                .upper
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("overlayfs session record missing upper path"))?,
+            work: record
+                .work
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("overlayfs session record missing work path"))?,
+        },
+        "apfs" => Layers::Snapshot {
+            snapshot: record
+                .snapshot
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("apfs session record missing snapshot path"))?,
+            parent_dev: record
+                .parent_dev
+                .ok_or_else(|| anyhow::anyhow!("apfs session record missing parent identity"))?,
+            parent_ino: record
+                .parent_ino
+                .ok_or_else(|| anyhow::anyhow!("apfs session record missing parent identity"))?,
+        },
+        other => anyhow::bail!("unknown backend `{other}` in session record"),
+    };
+    Ok(Sandbox {
+        target: record.target.clone(),
+        session_dir: session_dir.to_path_buf(),
+        layers,
+    })
 }
 
 /// Porcelain contract: entries sort by the raw byte order of the path —
@@ -91,20 +167,9 @@ pub fn sort_changes(changes: &mut [Change]) {
     });
 }
 
-/// Path of the "command actually started" marker for a sandbox. The exec
-/// child writes it after sandbox setup succeeds, immediately before the
-/// command runs; its absence after a failed child means the command never
-/// executed (fail closed). Lives in the session directory, outside any layer.
-pub fn marker_path(sandbox: &Sandbox) -> PathBuf {
-    sandbox
-        .upper
-        .parent()
-        .unwrap_or(&sandbox.upper)
-        .join("started")
-}
-
 /// Overlay mount option strings cannot represent these characters portably;
 /// refuse rather than risk mounting the wrong paths (safety: fail closed).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn validate_mount_path(path: &Path) -> Result<()> {
     let s = path.to_string_lossy();
     if s.contains(':') || s.contains(',') || s.contains('\\') {
