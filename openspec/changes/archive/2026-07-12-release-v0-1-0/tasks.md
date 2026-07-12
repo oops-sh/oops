@@ -19,4 +19,4 @@
 
 ## 5. Ship (user-gated)
 
-- [ ] 5.1 User runs `cargo login`; then `cargo publish`, tag `v0.1.0`, create the GitHub release linking crate + demo
+- [x] 5.1 User runs `cargo login`; then `cargo publish`, tag `v0.1.0`, create the GitHub release linking crate + demo
