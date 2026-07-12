@@ -80,6 +80,17 @@ pub fn in_test_container() -> bool {
     std::env::var_os("OOPS_TEST_CONTAINER").is_some()
 }
 
+/// Porcelain contract: entries sort by the raw byte order of the path —
+/// not locale collation, not path-component order.
+pub fn sort_changes(changes: &mut [Change]) {
+    changes.sort_by(|a, b| {
+        a.path
+            .as_os_str()
+            .as_encoded_bytes()
+            .cmp(b.path.as_os_str().as_encoded_bytes())
+    });
+}
+
 /// Path of the "command actually started" marker for a sandbox. The exec
 /// child writes it after sandbox setup succeeds, immediately before the
 /// command runs; its absence after a failed child means the command never
@@ -103,4 +114,30 @@ pub fn validate_mount_path(path: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sort_is_raw_byte_order_not_component_order() {
+        // '-' (0x2d) < '/' (0x2f): "a-b" must sort before "a/c", which is
+        // the opposite of PathBuf's component-wise ordering.
+        let mut changes = vec![
+            Change {
+                kind: ChangeKind::Added,
+                path: PathBuf::from("a/c"),
+                is_dir: false,
+            },
+            Change {
+                kind: ChangeKind::Added,
+                path: PathBuf::from("a-b"),
+                is_dir: false,
+            },
+        ];
+        sort_changes(&mut changes);
+        assert_eq!(changes[0].path, PathBuf::from("a-b"));
+        assert_eq!(changes[1].path, PathBuf::from("a/c"));
+    }
 }

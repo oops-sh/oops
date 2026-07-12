@@ -25,6 +25,28 @@ inspected and rolled back.
 | `oops undo` | Discard the sandbox — your files were never touched |
 | `oops commit` | Apply the sandbox to your real files |
 
+### Reading the diff
+
+```console
+$ oops run "rm -rf legacy/ && touch NOTES.md"
+$ oops diff
+Created (1)
+  NOTES.md
+
+Deleted (1)
+  legacy/
+
+1 created, 1 deleted
+```
+
+Colored on a TTY (honors `NO_COLOR`). For scripts and agents,
+`oops diff --porcelain` is the **stable** interface: `A/M/D path` lines,
+byte-order sorted, a deleted directory as a single `D path/` entry (the
+subtree is not expanded), empty output when nothing changed, exit 0 either
+way. Known limitation: paths containing newlines can't be represented in
+the line-oriented format (`-z` is reserved for a future NUL-terminated
+variant).
+
 ## Status: Phase 0 (proof of the core loop)
 
 Working today, inside a Linux environment:

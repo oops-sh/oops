@@ -37,8 +37,13 @@ enum Cmd {
         #[arg(value_name = "COMMAND")]
         command: String,
     },
-    /// List paths the pending sandbox created (A), modified (M), or deleted (D)
-    Diff,
+    /// Show what the pending sandbox created, modified, or deleted
+    Diff {
+        /// Stable machine-readable output for scripts/agents: `A/M/D path`
+        /// lines, byte-order sorted, never colored (frozen format)
+        #[arg(long)]
+        porcelain: bool,
+    },
     /// Discard the pending sandbox; the real files are untouched
     Undo,
     /// Apply the pending sandbox to the real files
@@ -78,7 +83,7 @@ fn main() {
 fn dispatch(cmd: Cmd) -> Result<i32> {
     match cmd {
         Cmd::Run { command } => run(&command),
-        Cmd::Diff => diff_cmd(),
+        Cmd::Diff { porcelain } => diff_cmd(porcelain),
         Cmd::Undo => undo(),
         Cmd::Commit => commit(),
         Cmd::Gc => {
@@ -180,13 +185,19 @@ fn run(command: &str) -> Result<i32> {
     Ok(code)
 }
 
-fn diff_cmd() -> Result<i32> {
+fn diff_cmd(porcelain: bool) -> Result<i32> {
     let backend = backend::select()?;
     let state = state::state_dir()?;
     let sess = pending_session(&state)?;
     ensure_not_stale(&sess)?;
     let changes = backend.changes(&sandbox_of(&sess.record))?;
-    print!("{}", diff::render(&changes));
+    if porcelain {
+        print!("{}", diff::render_porcelain(&changes));
+    } else {
+        use std::io::IsTerminal;
+        let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+        print!("{}", diff::render_human(&changes, color));
+    }
     Ok(0)
 }
 
