@@ -16,6 +16,13 @@ oops does not exist yet as a working program. Its entire value proposition — a
 - Integration test proving the flagship demo (create files → `oops run "rm -rf testdir"` → `oops undo` → files byte-identical), running only inside the Docker container via `make test-linux`.
 - Benchmark showing `undo` completes in < 100ms on a repo-sized tree.
 
+## Guarantees & failure semantics
+
+1. **Sandbox scope & undo guarantee boundary.** The sandbox covers exactly one directory tree: the working directory where `oops run` was invoked. The undo guarantee is *filesystem-only and target-tree-only*: writes outside that tree (`/tmp`, `$HOME`, other mounts), network side effects, spawned daemons, and process state are neither sandboxed nor undoable. This boundary is stated in the safety spec and must be documented honestly in the README and in `oops run`'s help text.
+2. **Commit partial-failure behavior.** `commit` is a non-atomic replay of the upper layer. If any step fails (permissions, disk full, path vanished), commit stops, reports what was and was not applied, exits non-zero, and **preserves** the session record and upper layer. Replay is idempotent, so re-running `commit` after fixing the cause completes the merge; `undo` at that point discards the remaining changes but cannot re-wind already-applied ones (reported clearly). To keep replay reliable, the overlay is mounted with `redirect_dir` off and `metacopy` off, so the upper layer contains only two special encodings: whiteouts (char 0:0) and opaque-directory xattrs (`trusted.overlay.opaque=y`). Both are handled explicitly; any unrecognized overlay xattr aborts commit before touching the real tree.
+3. **Undo strategy: rename-then-async-delete.** `undo`'s critical section is a single same-filesystem `rename()` of the session directory into `<state>/trash/` — O(1) regardless of change-set size, which is what makes the < 100ms target unconditional. Actual deletion happens asynchronously (a detached background deletion spawned by `undo`, plus the gc sweep below). The undo containment invariant applies to both phases: rename target and deletions are all inside the state directory.
+4. **Orphaned-state gc.** Crashes, reboots, or killed background deletions can leave orphans: undeleted `trash/` entries, session directories without a valid record, or records whose upper layer is gone. Every `oops run` opportunistically sweeps them (delete `trash/*`, remove invalid session dirs) before creating its own session. gc deletes only inside the state directory — same containment rule as undo — and never touches a session that is validly pending.
+
 ## Capabilities
 
 ### New Capabilities

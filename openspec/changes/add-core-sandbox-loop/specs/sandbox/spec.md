@@ -34,6 +34,17 @@ byte-identical to its pre-run state.
 - **WHEN** `oops run "rm -rf sub/"` completes in directory D containing `sub/`
 - **THEN** the upper layer contains a whiteout for `sub` and the real `D/sub` still exists with identical contents
 
+### Requirement: Sandbox scope
+The sandbox covers exactly one directory tree: the working directory where
+`oops run` was invoked. The overlay MUST be mounted with `redirect_dir` and
+`metacopy` disabled, so the upper layer's only special encodings are
+whiteouts (character device 0:0) and opaque-directory xattrs
+(`trusted.overlay.opaque`); this keeps diff and commit replay reliable.
+
+#### Scenario: Rename inside the sandbox degrades to copy-up plus whiteout
+- **WHEN** `oops run "mv a b"` completes in a sandboxed directory containing `a`
+- **THEN** the upper layer contains `b` as a full copy and a whiteout for `a`, with no `trusted.overlay.redirect` xattr anywhere in the upper layer
+
 ### Requirement: Command execution semantics
 `run` MUST execute the given command via the shell, inside the sandbox, with
 the working directory mapped to the sandboxed view of the invocation
@@ -54,6 +65,22 @@ modes MUST be preserved for regular files and directories.
 #### Scenario: Commit applies creations, modifications, and deletions
 - **WHEN** a pending sandbox contains one created file, one modified file, and one whiteout, and `oops commit` runs
 - **THEN** the real directory afterwards contains the created file, the new content of the modified file, and no trace of the deleted path
+
+### Requirement: Commit partial-failure semantics
+`commit` is a fail-stop, idempotent replay. On the first error it MUST stop,
+report the failing path and applied/remaining counts, exit non-zero, and
+preserve the session record and upper layer so that re-running `commit`
+completes the merge. Before modifying the real tree, commit MUST verify the
+upper layer contains no unrecognized overlay xattrs (anything beyond
+whiteouts and `trusted.overlay.opaque`) and abort if it does.
+
+#### Scenario: Commit fails midway
+- **WHEN** `oops commit` fails partway through the replay (e.g. a permission error on one path)
+- **THEN** oops exits non-zero naming the failing path, the session and upper layer remain intact, and a subsequent `oops commit` (after fixing the cause) completes the merge with the same end state as a single successful commit
+
+#### Scenario: Unrecognized overlay metadata
+- **WHEN** the upper layer contains an overlay xattr commit does not recognize
+- **THEN** commit aborts before modifying any real path and exits non-zero explaining what it found
 
 ### Requirement: Undo performance
 Discarding a sandbox MUST be O(size of changes), not O(size of the tree):

@@ -80,7 +80,45 @@ trait SnapshotBackend {
 `changes` lives on the backend (not a generic walker) because whiteout
 representation is backend-specific; APFS snapshots will diff differently.
 
-### D5: Dependencies
+### D5: Commit failure semantics — non-atomic replay, fail-stop, idempotent retry
+
+Commit walks the upper layer in a deterministic order (parents before
+children; within a directory: whiteouts/opaque first, then copies). On the
+first error it stops, prints applied/remaining counts and the failing path,
+exits non-zero, and leaves the session record + upper layer untouched.
+Because replay steps are idempotent (deleting an already-deleted path and
+re-copying the same content are both no-ops), `commit` can simply be re-run.
+The overlay is mounted with `redirect_dir=off,metacopy=off` (plus `xino=off`)
+so renames degrade to copy-up + whiteout and the upper layer never contains
+`trusted.overlay.redirect` or metacopy stubs; commit verifies this and
+aborts before touching the real tree if it sees an overlay xattr it does not
+recognize. Alternative considered: staging the merge in a temp dir and
+atomically swapping — rejected for Phase 0 (directory-tree swaps are not
+atomic on Linux anyway; honesty + idempotence is simpler and safer).
+
+### D6: Undo — rename-then-async-delete
+
+`undo` must be O(1), not O(changes): its critical section is one
+`rename(sessions/<id>, trash/<id>.<nonce>)` within the state directory
+(same filesystem, atomic, fast). It then spawns a detached
+`oops __gc` child to delete trash contents in the background and returns
+immediately. If the background deletion dies, the entry just stays in
+`trash/` until the next gc sweep — never a correctness problem, only disk
+space. This makes the < 100ms benchmark independent of change-set size.
+
+### D7: Orphaned-state gc — opportunistic sweep on `run`
+
+At the start of every `oops run` (before creating its own session), oops
+sweeps the state directory: delete everything under `trash/`, and move any
+session directory that has no parseable `session.json` into `trash/`.
+Validly pending sessions are never touched. The hidden `__gc` subcommand
+performs the same sweep (used both by undo's background deletion and
+manually). All gc deletions go through the same containment check as undo:
+canonicalized paths must be inside the state directory. Alternative
+considered: a persistent daemon or cron — rejected; opportunistic sweep is
+zero-infrastructure and the state dir is small.
+
+### D8: Dependencies
 
 `clap` (derive), `anyhow`, `serde`+`serde_json`, `nix` (mount, unshare,
 mknod detection), `tempfile` (dev-dep). `nix` is the one addition beyond the
