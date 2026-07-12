@@ -36,9 +36,12 @@ restorable, not deletable).
 constant number of atomic same-filesystem operations — for interception
 backends, one rename of the session directory into the state root's
 `trash/`; for snapshot-restore backends, the identity-checked swap followed
-by that rename — after which undo reports success. Deletion of trash
-contents happens asynchronously (background process and/or later gc sweep).
-An undeleted trash entry MUST never affect correctness — only disk usage.
+by that rename — after which undo reports success. The swap deposits the
+displaced tree inside the session directory, so the same rename carries it
+into `trash/`, where it is deleted like any other trash content. Deletion
+of trash contents happens asynchronously (background process and/or later
+gc sweep). An undeleted trash entry MUST never affect correctness — only
+disk usage.
 
 #### Scenario: Undo of a huge change set
 - **WHEN** `oops undo` runs against a sandbox whose change set contains tens of thousands of entries
@@ -47,6 +50,10 @@ An undeleted trash entry MUST never affect correctness — only disk usage.
 #### Scenario: Background deletion dies
 - **WHEN** the asynchronous deletion is killed before finishing
 - **THEN** the leftover trash entry is removed by a later gc sweep, and no oops command misbehaves in the meantime
+
+#### Scenario: Displaced tree from a snapshot-restore undo is reclaimed
+- **WHEN** `oops undo` restores an APFS session via the atomic swap, displacing the command's tree into the session directory
+- **THEN** the displaced tree lands in the state root's `trash/` and is removed by the asynchronous deletion or a later gc sweep — it does not accumulate across undos
 
 ### Requirement: Orphaned-state gc
 Every `oops run` MUST sweep oops state before creating its session: delete
@@ -126,7 +133,20 @@ against recorded target paths. This is what makes the deleted-target and
 symlink restore branches reachable from a shell still sitting in the
 damaged location.
 
+`$PWD` is a lookup hint, never an authority: lookup (by either key) only
+selects which pending session record to act on. The path that undo
+restores is always the record's canonical target, and the safety spec's
+identity verification — the parent `st_dev`/`st_ino` check and the three
+restore branches — MUST execute unconditionally, regardless of how the
+session was found. A forged or stale `$PWD` can therefore at most select
+a session that would restore its own recorded target; it can never
+redirect a restore.
+
 #### Scenario: Undo from a deleted cwd
 - **WHEN** the wrapped command deleted the target directory and the user runs `oops undo` from a shell whose `$PWD` still names it
 - **THEN** the session is found via the `$PWD` fallback and the restore proceeds per the safety spec's branches
+
+#### Scenario: $PWD cannot redirect a restore
+- **WHEN** `oops undo` finds a session via the `$PWD` fallback
+- **THEN** the restore acts on the record's canonical target, with the parent identity check and the restore-branch checks applied exactly as for a canonical-cwd lookup
 

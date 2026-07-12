@@ -400,6 +400,50 @@ fn fail_closed_when_state_root_unusable() {
 }
 
 #[test]
+fn displaced_tree_from_undo_is_reclaimed_by_gc() {
+    destructive_only!();
+    let w = world();
+    seed_tree(&w.target);
+    let before = manifest(&w.target);
+
+    w.run_ok("rm -rf testdir && echo damage > evidence.txt");
+    let out = w.oops(&["undo"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(manifest(&w.target), before, "damage undone");
+
+    // The swap displaced the damaged tree into the session directory,
+    // and undo renamed that whole directory into trash: nothing pending.
+    let oops_root = w.state_home.join("oops");
+    assert_eq!(
+        std::fs::read_dir(oops_root.join("sessions")).unwrap().count(),
+        0,
+        "the session (and displaced tree) must leave sessions/"
+    );
+
+    // Async reclamation: undo's background gc or a later sweep must
+    // delete the trash entry. Poll with explicit sweeps so the test is
+    // deterministic even if the background gc lost the race.
+    let trash = oops_root.join("trash");
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let leftover = std::fs::read_dir(&trash).map(|d| d.count()).unwrap_or(0);
+        if leftover == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "displaced tree still in trash after 5s of gc sweeps"
+        );
+        w.oops(&["__gc"]);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        !w.target.join("evidence.txt").exists(),
+        "displaced content must not resurface in the target"
+    );
+}
+
+#[test]
 fn undo_after_new_process_like_a_reboot() {
     destructive_only!();
     let w = world();

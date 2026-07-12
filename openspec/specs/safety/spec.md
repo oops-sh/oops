@@ -57,9 +57,14 @@ and MUST NOT claim or imply undo coverage beyond it.
 Regardless of session-state corruption or invalid input, undo and gc MUST
 NOT remove, truncate, rewrite, or swap any other path on the system.
 After a snapshot-restore undo, the displaced tree (the state the command
-left behind) sits in a state root's trash awaiting asynchronous deletion:
-it is not diffable, not recoverable through any oops command, and the
-session is consumed — `oops diff` reports no pending sandbox. Backends
+left behind) is captured inside the session directory by the restore and
+carried by the same rename into the state root's trash. It is not
+diffable and not recoverable through any oops command (undo has no
+redo), and the session is consumed — `oops diff` reports no pending
+sandbox. In trash it is ordinary trash content: asynchronous deletion
+and later gc sweeps MUST reclaim it under the session spec's
+rename-then-async-delete policy, so repeated undos never grow the state
+roots unboundedly. Backends
 that never modify the target during undo (e.g. OverlayFS, which discards
 a layer) automatically satisfy clause 1 by doing nothing to the target.
 
