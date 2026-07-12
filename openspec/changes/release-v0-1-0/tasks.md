@@ -6,16 +6,16 @@
 
 ## 2. Packaging
 
-- [ ] 2.1 Cargo.toml release metadata: version 0.1.0, description mentioning the Linux-only runtime, keywords, categories, `readme`, `include` allowlist; verify with `cargo package --list` and `cargo publish --dry-run`
+- [ ] 2.1 Cargo.toml release metadata: crate renamed `oops-sh` with `[[bin]] name = "oops"`, version 0.1.0, description mentioning the crate/binary mapping and Linux-only runtime, `repository`, keywords, categories, `readme`, `include` allowlist; verify with `cargo package --list` and `cargo publish --dry-run`
 
 ## 3. Demo recording
 
 - [ ] 3.1 `demo/demo.tape` (VHS, pinned version, fixed geometry) replaying the flagship demo; `docker/demo.Dockerfile` (FROM oops-dev + VHS); `make demo-gif` target
-- [ ] 3.2 Generate `demo/demo.gif`, commit it, embed in README via the raw.githubusercontent URL
+- [ ] 3.2 Generate `demo/demo.gif` (≤ 3 MB, enforced in the make target), commit it, embed in README via the raw.githubusercontent URL
 
 ## 4. README release polish
 
-- [ ] 4.1 Install section (`cargo install oops`, Linux-only caveat with the container escape hatch), GIF at the top, license section
+- [ ] 4.1 Install section (`cargo install oops-sh` → run `oops`, with the mapping spelled out; Linux-only caveat with the container escape hatch), GIF at the top, license section
 
 ## 5. Ship (user-gated)
 
