@@ -11,7 +11,7 @@ DOCKER_RUN   := docker run --rm --privileged \
 	-v oops-target-linux:/oops/target \
 	$(DOCKER_IMAGE)
 
-.PHONY: docker-image test-linux bench-linux shell-linux check test
+.PHONY: docker-image test-linux bench-linux demo-gif shell-linux check test
 
 docker-image:
 	docker build -t $(DOCKER_IMAGE) docker
@@ -24,6 +24,23 @@ test-linux: docker-image
 # The undo performance benchmark (< 100ms on a ~10k-file tree).
 bench-linux: docker-image
 	$(DOCKER_RUN) cargo test --release bench_undo -- --ignored --nocapture
+
+# Re-render demo/demo.gif from demo/demo.tape (spec: must stay <= 3 MB).
+demo-gif: docker-image
+	docker build -t oops-demo -f docker/demo.Dockerfile docker
+	docker run --rm --privileged \
+		--tmpfs /root/.local/state/oops \
+		-v $(PWD):/oops \
+		-v oops-cargo-registry:/usr/local/cargo/registry \
+		-v oops-target-linux:/oops/target \
+		oops-demo bash -c '\
+		cargo build --release \
+		&& install -m755 target/release/oops /usr/local/bin/oops \
+		&& mkdir -p /root/demo \
+		&& vhs demo/demo.tape \
+		&& size=$$(stat -c%s demo/demo.gif) \
+		&& echo "demo.gif: $$size bytes" \
+		&& test $$size -le 3145728'
 
 # Interactive shell inside the Linux test environment.
 shell-linux: docker-image
