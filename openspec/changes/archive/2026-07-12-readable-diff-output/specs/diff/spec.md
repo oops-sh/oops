@@ -20,7 +20,7 @@ between versions. The frozen contract includes:
   subtree is deleted recursively. Consumers MUST NOT expect per-descendant
   lines; oops never enumerates the lower layer to expand them.
 
-#### Scenario: Mixed change set (porcelain)
+#### Scenario: Mixed change set
 - **WHEN** a pending sandbox contains a new file `n`, a modified file `m`, and a deleted file `d`, and `oops diff --porcelain` runs
 - **THEN** stdout is exactly the lines `D d`, `M m`, `A n` (byte order of the paths), with no color codes
 
