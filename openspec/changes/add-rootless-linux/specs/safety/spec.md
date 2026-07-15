@@ -23,9 +23,32 @@ to undo containment: undo restores the target and touches only state roots;
 commit modifies the target only per the recognized encodings and aborts
 before touching real files otherwise.
 
+Under the rootless model the upper layer's `user.overlay.*` xattrs are
+**untrusted, adversary-controlled input**: user-namespace overlay stores
+metadata in the `user.*` xattr namespace, which the file's owner — i.e. any
+process inside the sandbox, including a prompt-injected (tier-3) agent — can
+set to arbitrary values on upper-layer files. This is a change in trust from
+the old privileged model, where `trusted.overlay.*` could only be written by
+root and the metadata was trustworthy. Commit therefore MUST treat every
+`user.overlay.redirect` value as hostile: before any replay, it MUST resolve
+the value (absolute values relative to the overlay root, relative values
+relative to the redirected directory's parent), **canonicalize** the
+resulting source and destination paths, and verify that both remain inside
+the protected target tree (with the state roots as the only other permitted
+location). A redirect whose resolved path escapes the protected tree via `..`
+traversal, resolves to an out-of-tree absolute path, or passes through a
+symlink at any component MUST cause commit to abort before touching any real
+path, under the same fail-closed, idempotent-retry semantics as unrecognized
+metadata. A forged redirect can therefore never make commit write outside the
+protected tree — it can at most abort the commit.
+
 #### Scenario: Recognized encodings are replayed, everything else aborts before touching real files
 - **WHEN** `oops commit` runs against an upper layer containing whiteouts, `user.overlay.opaque`, and `user.overlay.redirect` entries
 - **THEN** commit replays exactly those to the real tree; and **WHEN** any other overlay metadata is present, commit aborts during the read-only classification pass having modified no real path, and exits non-zero explaining what it found
+
+#### Scenario: Forged redirect pointing outside the protected tree is refused
+- **WHEN** a process inside the sandbox sets a `user.overlay.redirect` whose value resolves outside the protected target tree (an out-of-tree absolute path, a `..` traversal such as `../../../home/<user>/.ssh`, or a value passing through a symlink) and `oops commit` runs
+- **THEN** commit rejects it during the read-only classification pass, modifies no real path (the out-of-tree target is byte-identical afterward), exits non-zero explaining the containment violation, and a subsequent commit after the offending xattr is removed completes normally
 
 #### Scenario: Interrupted commit is safely re-runnable
 - **WHEN** a commit replay is interrupted partway (error or kill) after modifying some real paths

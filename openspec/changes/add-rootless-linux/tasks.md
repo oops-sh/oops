@@ -35,6 +35,13 @@ group 3 (nested userns) depends on 1; group 5 (acceptance) depends on all.
   apply the destination's own child changes; make the paired source-whiteout
   idempotent; handle the "source created in-sandbox → plain create" degrade;
   enforce outermost-first / source-before-whiteout ordering.
+- [ ] 2.3a **Treat every redirect value as untrusted, adversary-controlled
+  input** (`user.*` xattrs are owner-writable, so a sandboxed process can
+  forge them): in the classification pass, resolve → canonicalize → verify
+  both source and destination stay inside the protected tree (state roots the
+  only other allowed location); reject `..` escapes, out-of-tree absolute
+  paths, and symlink-traversing components — abort-before-touch, idempotent
+  retry. A forged redirect can at most abort the commit.
 - [ ] 2.4 Extend the recognized set to exactly {whiteout,
   `user.overlay.opaque`, `user.overlay.redirect`}; abort fail-closed on any
   other `user.overlay.*` key, any `trusted.overlay.*`, or unknown metadata —
@@ -71,6 +78,11 @@ group 3 (nested userns) depends on 1; group 5 (acceptance) depends on all.
   `newdir` (contents intact), no `olddir`.
 - [ ] 5.6 fail-closed: unrecognized `user.overlay.*` key aborts commit before
   any real write; retry after removal completes.
+- [ ] 5.6a **adversarial redirect**: inject a malicious `user.overlay.redirect`
+  (out-of-tree absolute path; `..` escape; symlink relay) → commit aborts →
+  the out-of-tree target is byte-identical (untouched) → after removing the
+  xattr, retry completes. Sits alongside the `trusted.overlay` injection test,
+  not replacing it.
 - [ ] 5.7 **Migrate** `commit_aborts_on_unrecognized_overlay_xattr_and_retry
   _completes`: inject a genuinely-unknown key (not `redirect`, which is now
   handled); keep the abort+retry assertions.

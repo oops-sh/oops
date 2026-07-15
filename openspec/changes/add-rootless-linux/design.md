@@ -78,6 +78,31 @@ redirects resolve outermost-first. The replay walk therefore does a
 before the mutation pass, rather than the current single-pass recursion. This
 is the substantive code change and the main risk.
 
+### Redirect values are untrusted, adversary-controlled input
+
+Critical trust change from the old model. Privileged overlay wrote metadata
+to `trusted.overlay.*`, writable only by root, so a redirect value was
+trustworthy. Rootless overlay uses `user.overlay.*`, and **`user.*` xattrs
+are settable by the file's owner** — i.e. by any process inside the sandbox,
+including a tier-3 prompt-injected agent. Such an agent can set an arbitrary
+`user.overlay.redirect` on an upper-layer file, forging a value that points
+**outside** the protected tree (`../../../home/<user>/.ssh`, an absolute
+out-of-tree path, or a value routed through a symlink). If commit's replay
+followed it naively, the write would land outside the target — our own commit
+code would punch through the containment invariant.
+
+So every redirect value is treated as hostile. In the classification pass,
+before any mutation, replay MUST: (1) resolve the value (absolute → overlay
+root; relative → the redirected dir's parent); (2) **canonicalize** the
+resolved source and destination; (3) verify both are inside the protected
+target tree (state roots the only other permitted location); (4) reject —
+abort-before-touch, idempotent retry — any redirect that escapes via `..`,
+resolves to an out-of-tree absolute path, or passes through a symlink at any
+component. A forged redirect can then at most abort the commit; it can never
+redirect a real-file write. This is written into the safety-spec invariant
+(the flagged delta) and covered by an adversarial test alongside the existing
+`trusted.overlay` injection test (not replacing it).
+
 ### The fail-closed boundary — unchanged in spirit, restated in form
 
 Today: commit refuses **any** overlay metadata beyond whiteouts and

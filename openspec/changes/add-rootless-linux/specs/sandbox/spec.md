@@ -58,7 +58,11 @@ performs no replay — see "Snapshot-restore commit".)
 
 #### Scenario: Recognized redirect metadata is replayed
 - **WHEN** the upper layer contains a `user.overlay.redirect` produced by an in-sandbox directory rename and `oops commit` runs
-- **THEN** commit replays it to the correct real end-state (the lower source becomes the renamed destination with contents intact) rather than aborting
+- **THEN** commit canonicalizes and validates the redirect's resolved source and destination as inside the protected tree, then replays it to the correct real end-state (the lower source becomes the renamed destination with contents intact) rather than aborting
+
+#### Scenario: Forged out-of-tree redirect is refused
+- **WHEN** the upper layer contains a `user.overlay.redirect` (adversary-writable, since `user.*` xattrs are owner-settable) whose value resolves outside the protected tree and `oops commit` runs
+- **THEN** commit rejects it in the read-only classification pass, modifies no real path, and exits non-zero — a forged redirect can at most abort the commit, never redirect a write outside the protected tree (see safety's "Commit real-file modification boundary")
 
 #### Scenario: Unrecognized overlay metadata
 - **WHEN** the upper layer contains an overlay xattr outside the recognized set
