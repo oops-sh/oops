@@ -4,6 +4,26 @@ Task groups are ordered so the **redirect_dir migration (group 2) gates
 everything that touches commit**. Groups 1 and 2 can proceed in parallel;
 group 3 (nested userns) depends on 1; group 5 (acceptance) depends on all.
 
+## Implementation status (branch `feat/rootless-linux`)
+
+- **Done and green in the container suite** (15/15 tests): Group 1 (rootless
+  userns + `metacopy=off,userxattr` mount + explicit `OOPS_PRIVILEGED`
+  fallback), Group 3 (nested child userns B; umount/nsenter proven blocked),
+  Group 2 (full redirect migration: `user.overlay.*`, classify-then-mutate,
+  redirect replay, mutate-time `O_NOFOLLOW` containment anchored on the
+  recorded parent identity), Group 5 (escape-vector + adversarial redirect
+  tests, incl. `..`-escape and symlink-relay TOCTOU), Group 7.3 (README).
+- **Deferred with rationale — Group 4 (session token):** it belongs to
+  `oops shell`, not `oops run`. A token is only meaningful if a **persistent
+  launcher** holds it out-of-band and performs finalize; for `oops run` the
+  launcher exits after the run and `commit`/`undo` are fresh processes, and a
+  token stored in the on-disk session record is readable by the in-sandbox
+  command itself (so it adds nothing there). On Linux the nested userns is
+  already the tier-3 guarantee; the token's home is the `oops shell` change.
+- **Needs bare-metal (Group 6):** the container run uses a privileged
+  container (seccomp off) on LinuxKit 6.10; the true no-root + distro-policy
+  matrix must run on real Ubuntu/Debian/Fedora — see §6.
+
 ## 1. Rootless namespace setup (no commit-path changes)
 
 - [ ] 1.1 Replace the overlayfs mount options with `metacopy=off,userxattr`

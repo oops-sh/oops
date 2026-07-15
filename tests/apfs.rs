@@ -415,7 +415,9 @@ fn displaced_tree_from_undo_is_reclaimed_by_gc() {
     // and undo renamed that whole directory into trash: nothing pending.
     let oops_root = w.state_home.join("oops");
     assert_eq!(
-        std::fs::read_dir(oops_root.join("sessions")).unwrap().count(),
+        std::fs::read_dir(oops_root.join("sessions"))
+            .unwrap()
+            .count(),
         0,
         "the session (and displaced tree) must leave sessions/"
     );

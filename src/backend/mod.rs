@@ -29,6 +29,13 @@ pub enum Layers {
     Overlay {
         upper: PathBuf,
         work: PathBuf,
+        /// The target's parent identity at run time (same anchor undo
+        /// containment uses). Commit re-verifies it before replaying, so the
+        /// tree root cannot be swapped between run and commit. Optional for
+        /// backward compatibility with records written before it was
+        /// threaded through.
+        parent_dev: Option<u64>,
+        parent_ino: Option<u64>,
     },
     Snapshot {
         snapshot: PathBuf,
@@ -134,6 +141,8 @@ pub fn sandbox_of(session_dir: &Path, record: &SessionRecord) -> Result<Sandbox>
                 .work
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("overlayfs session record missing work path"))?,
+            parent_dev: record.parent_dev,
+            parent_ino: record.parent_ino,
         },
         "apfs" => Layers::Snapshot {
             snapshot: record

@@ -56,9 +56,9 @@ $ cargo install oops-sh
 **The crate is `oops-sh`, the command is `oops`** — the crates.io name
 `oops` was already taken, so you install `oops-sh` and run `oops`.
 
-Runs natively on **Linux** (OverlayFS) and **macOS** (APFS `clonefile`,
-no root needed). On any other platform `oops run` refuses to execute the
-command rather than run it unsandboxed.
+Runs natively on **Linux** (OverlayFS, no root needed on kernel ≥ 5.11) and
+**macOS** (APFS `clonefile`, no root needed). On any other platform
+`oops run` refuses to execute the command rather than run it unsandboxed.
 
 ## Two backends, two guarantees
 
@@ -75,8 +75,19 @@ this table once:
 | Crash mid-window | tree already pristine | tree modified; `oops undo` after restart restores |
 | Other processes' writes during run | survive undo | reverted by undo (collateral) |
 | Cloud-synced folders | safe | transient damage may propagate — avoid |
-| Root required | yes (for now) | no |
+| Root required | no (unprivileged user namespaces, kernel ≥ 5.11) | no |
 | `diff` cost | O(changes) | O(tree) metadata |
+
+On Linux the wrapped command runs inside a nested user namespace it cannot
+dismantle: it cannot unmount the sandbox, escape the mount namespace, or
+reach the real files — so an agent placed inside cannot force its changes
+onto disk (the commit/undo decision stays outside). This targets a
+prompt-injected agent (tier 3); a tier-4 adversary engineering a kernel or
+hypervisor escape is out of scope and needs a hardware-isolated VM. Where
+unprivileged user namespaces are unavailable (older kernels, some
+Debian/Ubuntu AppArmor policies), `oops run` refuses with the sysctl to
+change, and an explicit `OOPS_PRIVILEGED=1` root fallback exists (weaker,
+tier-1/2, no nested namespace).
 
 On macOS, between `run` and `undo`/`commit` your real files hold the
 command's changes: file watchers, editors, Spotlight, and cloud sync
