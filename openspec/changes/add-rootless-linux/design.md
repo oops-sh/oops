@@ -92,16 +92,42 @@ followed it naively, the write would land outside the target — our own commit
 code would punch through the containment invariant.
 
 So every redirect value is treated as hostile. In the classification pass,
-before any mutation, replay MUST: (1) resolve the value (absolute → overlay
-root; relative → the redirected dir's parent); (2) **canonicalize** the
-resolved source and destination; (3) verify both are inside the protected
-target tree (state roots the only other permitted location); (4) reject —
-abort-before-touch, idempotent retry — any redirect that escapes via `..`,
-resolves to an out-of-tree absolute path, or passes through a symlink at any
-component. A forged redirect can then at most abort the commit; it can never
-redirect a real-file write. This is written into the safety-spec invariant
-(the flagged delta) and covered by an adversarial test alongside the existing
-`trusted.overlay` injection test (not replacing it).
+before any mutation, replay resolves the value (absolute → overlay root;
+relative → the redirected dir's parent), canonicalizes source and
+destination, and rejects anything that escapes via `..`, an out-of-tree
+absolute path, or a symlink component. **But this static check is necessary,
+not sufficient** — and the containment guarantee must not rest on it (see the
+TOCTOU note below).
+
+### The check is at mutate time, relative to O_NOFOLLOW-verified fds (TOCTOU)
+
+Replay mutates the tree as it runs, so a path that resolved *inside* the tree
+during the classification pass can be made to *escape* by the time it is
+acted on: an earlier replayed rename can lay a later path's component across a
+**newly created symlink**. A string check done up front cannot see that. So
+the real defense is at the moment of mutation:
+
+- Every replayed rename/write is performed relative to a **directory fd built
+  by walking the path one component at a time with `openat(..., O_NOFOLLOW)`**
+  (equivalently a symlink-non-following `renameat2`/`*at` construction). If
+  any component is a symlink, the `O_NOFOLLOW` open fails and replay aborts —
+  so the path acted on at mutate time is provably the verified in-tree path,
+  and cannot have been redirected through a symlink inserted mid-replay.
+- The symlink prohibition covers **upper-layer newly-created symlinks**, not
+  just lower pre-existing ones — the `O_NOFOLLOW` walk doesn't care which
+  layer produced the symlink; any symlink component aborts.
+- The **anchor** for "inside the tree" is the target root's canonical path +
+  recorded `st_dev`/`st_ino` captured before the command ran (the same
+  identity anchor undo containment uses), re-verified at commit time — **not**
+  the on-disk path during replay. This stops the tree root itself from being
+  swapped between run and commit.
+
+The invariant to state plainly: *containment comes from mutate-time operations
+relative to O_NOFOLLOW-verified fds anchored on the pre-run root identity, not
+from the classification pass's string check.* Covered by adversarial tests —
+a forged out-of-tree redirect **and** a multi-redirect TOCTOU case (earlier
+step plants a symlink, later step tries to traverse it) — both alongside the
+existing `trusted.overlay` injection test, not replacing it.
 
 ### The fail-closed boundary — unchanged in spirit, restated in form
 

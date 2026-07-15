@@ -38,10 +38,19 @@ group 3 (nested userns) depends on 1; group 5 (acceptance) depends on all.
 - [ ] 2.3a **Treat every redirect value as untrusted, adversary-controlled
   input** (`user.*` xattrs are owner-writable, so a sandboxed process can
   forge them): in the classification pass, resolve → canonicalize → verify
-  both source and destination stay inside the protected tree (state roots the
-  only other allowed location); reject `..` escapes, out-of-tree absolute
-  paths, and symlink-traversing components — abort-before-touch, idempotent
-  retry. A forged redirect can at most abort the commit.
+  both source and destination stay inside the protected tree; reject `..`
+  escapes, out-of-tree absolute paths, and symlink-traversing components. This
+  static check is necessary but not sufficient.
+- [ ] 2.3b **Enforce containment at mutate time, not via the string check
+  (TOCTOU)**: perform every replayed rename/write relative to a directory fd
+  built by walking the path component-by-component with `openat(O_NOFOLLOW)`
+  (or a symlink-non-following `renameat2`/`*at` construction), so a symlink
+  planted by an earlier replay step cannot redirect a later mutation. The
+  symlink prohibition covers upper-layer newly-created symlinks, not just
+  pre-existing lower ones. Anchor "inside the tree" on the target root's
+  canonical path + recorded `st_dev`/`st_ino` from before the command ran (the
+  undo-containment identity anchor), re-verified at commit time — not the
+  on-disk path during replay. Abort-before-touch, idempotent retry.
 - [ ] 2.4 Extend the recognized set to exactly {whiteout,
   `user.overlay.opaque`, `user.overlay.redirect`}; abort fail-closed on any
   other `user.overlay.*` key, any `trusted.overlay.*`, or unknown metadata —
@@ -83,6 +92,12 @@ group 3 (nested userns) depends on 1; group 5 (acceptance) depends on all.
   the out-of-tree target is byte-identical (untouched) → after removing the
   xattr, retry completes. Sits alongside the `trusted.overlay` injection test,
   not replacing it.
+- [ ] 5.6b **TOCTOU redirect**: orchestrate multiple redirects where an earlier
+  replayed step creates/replaces a symlink and a later redirect tries to
+  traverse it out of the tree → the mutate-time `O_NOFOLLOW` walk refuses →
+  commit aborts, the out-of-tree file is byte-identical, retry after removal
+  completes. This is the test that would pass a static-only check and fail a
+  mutate-time check — it proves the guarantee is at the right layer.
 - [ ] 5.7 **Migrate** `commit_aborts_on_unrecognized_overlay_xattr_and_retry
   _completes`: inject a genuinely-unknown key (not `redirect`, which is now
   handled); keep the abort+retry assertions.
