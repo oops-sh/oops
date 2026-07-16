@@ -129,6 +129,36 @@ a forged out-of-tree redirect **and** a multi-redirect TOCTOU case (earlier
 step plants a symlink, later step tries to traverse it) — both alongside the
 existing `trusted.overlay` injection test, not replacing it.
 
+### Two passes: classify records the ops, mutate replays only those
+
+To make the mutate-time fds the *sole* authority, the passes are split
+cleanly. The classification pass walks the upper **once**, validates every
+xattr and redirect value, and emits an ordered operation list (whiteout /
+dir / redirect-with-resolved-source / symlink / file). The mutation pass
+consumes only that list and **never re-reads the upper layer's structure** —
+so a metadata or path-structure change between the two passes cannot change
+*what* is done, only (at most) abort the commit. Reading a file's *bytes* out
+of the upper at mutate time is fine and deliberate: the containment invariant
+governs *where* a write lands, not *what* bytes it contains, and the upper's
+bytes are the adversary's own sandbox output — moving them into a verified
+in-tree location is commit's whole job, and content changed between the
+passes is still just the adversary's own content, adding no attack surface.
+
+The one subtlety this forces: the **read** side must be fd-anchored too. An
+`Op::File` reads the upper via an `O_NOFOLLOW` component walk from a verified
+**upper-layer root fd** — not to protect the bytes, but to stop an upper path
+*component* swapped to a symlink between the passes from redirecting the read
+outside the upper layer. So both sides — write (target tree) and read (upper
+layer) — resolve every path through `O_NOFOLLOW` walks off a verified root fd,
+and no step re-parses a path string at mutate time. The upper-side check
+shares `resolve_parent_nofollow` with the write side (exercised by the
+existing symlink-relay TOCTOU test) and has its own unit test.
+
+Ordering note: within a directory level the classify pass emits non-whiteout
+ops (and their subtree) before that level's whiteouts, so a directory rename
+moves its source before any sibling whiteout would delete it — deterministic,
+where the old single-pass recursion depended on `readdir` order.
+
 ### The fail-closed boundary — unchanged in spirit, restated in form
 
 Today: commit refuses **any** overlay metadata beyond whiteouts and

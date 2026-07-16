@@ -114,22 +114,29 @@ impl SnapshotBackend for OverlayFs {
 
     fn merge(&self, sandbox: &Sandbox) -> Result<()> {
         let (upper, _) = layers(sandbox)?;
-        // Phase A (read-only classification): reject any overlay metadata
-        // outside the recognized set, and statically reject redirect values
-        // that escape the tree — all before touching any real path. This
-        // static check is necessary but NOT sufficient (see Phase B).
-        let total = validate_upper(upper)?;
-        // Open and verify the target root, anchored on the recorded parent
-        // identity, so the tree root cannot be swapped between run and commit.
+        // Phase A (read-only classification): walk the upper ONCE, reject any
+        // overlay metadata outside the recognized set and any redirect value
+        // that escapes the tree, and record the ordered operation list.
+        // Nothing real is touched here. This static check is necessary but
+        // NOT sufficient (see Phase B).
+        let mut ops = Vec::new();
+        classify(upper, Path::new(""), &mut ops)?;
+        let total = ops.len();
+        // Verified fds anchor every path resolution in Phase B: the tree root
+        // (write side) on the recorded parent identity so it cannot be swapped
+        // between run and commit; the upper root (read side) opened nofollow.
         let root = open_verified_root(&sandbox.target, overlay_parent_identity(sandbox))?;
-        // Phase B: fail-stop, idempotent replay. Every real-file mutation is
-        // performed relative to O_NOFOLLOW-verified directory fds rooted here,
-        // so a symlink planted mid-replay cannot redirect a write out of the
-        // tree (the mutate-time TOCTOU guarantee).
+        let upper_root = open_dir_nofollow(upper)
+            .with_context(|| format!("cannot open upper layer {} (nofollow)", upper.display()))?;
+        // Phase B: fail-stop, idempotent replay. It acts ONLY on `ops` and
+        // never re-reads either layer's directory structure; every mutation
+        // (and every upper-side read) is performed relative to O_NOFOLLOW
+        // component-walked fds, so a symlink planted between the passes cannot
+        // redirect a read or a write out of the tree (the TOCTOU guarantee).
         let mut applied = 0usize;
-        replay_dir(upper, &root, &root, &mut applied).map_err(|e| {
+        apply_ops(&ops, &root, &upper_root, &mut applied).map_err(|e| {
             e.context(format!(
-                "commit stopped after applying {applied} of {total} entries; \
+                "commit stopped after applying {applied} of {total} operations; \
                  the session is preserved — fix the cause and re-run `oops commit`"
             ))
         })?;
@@ -400,32 +407,94 @@ fn normalize_redirect(value: &OsStr, base_rel: &Path) -> Result<PathBuf> {
     Ok(stack.iter().collect())
 }
 
-/// Pre-commit validation walk (read-only). Rejects unrecognized overlay
-/// metadata and statically rejects redirect values that escape the tree,
-/// before any real path is touched. Returns the number of replayable entries.
-fn validate_upper(upper: &Path) -> Result<usize> {
-    let mut count = 0usize;
-    // (absolute upper path, tree-relative path) pairs.
-    let mut stack = vec![(upper.to_path_buf(), PathBuf::new())];
-    while let Some((dir, rel)) = stack.pop() {
-        check_overlay_xattrs(&dir)?;
-        for entry in std::fs::read_dir(&dir)? {
-            let path = entry?.path();
-            let name = path.file_name().unwrap_or_default();
-            let rel_path = rel.join(name);
-            check_overlay_xattrs(&path)?;
-            if let Some(val) = redirect_value(&path) {
-                // Static containment: reject a redirect whose value escapes
-                // the tree. `rel` is the dir containing the entry.
-                normalize_redirect(&val, &rel)?;
+/// One replay operation, fully resolved and validated at classification time.
+/// Phase B consumes this list and never re-reads the upper layer's structure,
+/// so a metadata or path-structure change between the two passes cannot steer
+/// a real-file mutation. All `rel` paths are relative to the tree root.
+enum Op {
+    /// Delete the lower path (a whiteout).
+    Whiteout { rel: PathBuf },
+    /// Ensure a directory exists at `rel`; `opaque` first clears the lower.
+    Dir {
+        rel: PathBuf,
+        mode: u32,
+        opaque: bool,
+    },
+    /// Directory rename: move the validated in-tree `source` onto `rel`.
+    Redirect {
+        rel: PathBuf,
+        mode: u32,
+        source: PathBuf,
+    },
+    /// Create or replace a symlink at `rel` pointing to `target`.
+    Symlink { rel: PathBuf, target: PathBuf },
+    /// Copy a regular file: read the upper at `rel`, write the lower at `rel`.
+    File { rel: PathBuf, mode: u32 },
+}
+
+/// Read-only classification pass: walk the upper ONCE, reject unrecognized or
+/// tree-escaping metadata, and record the ordered operation list. Within a
+/// level, non-whiteout ops (and the whole subtree below them) are emitted
+/// before that level's whiteouts, so a directory rename moves its source
+/// before any sibling whiteout would delete it.
+fn classify(upper_dir: &Path, rel: &Path, ops: &mut Vec<Op>) -> Result<()> {
+    check_overlay_xattrs(upper_dir)?;
+    let mut whiteouts: Vec<OsString> = Vec::new();
+    let mut subdirs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(upper_dir)? {
+        let entry = entry?;
+        let upath = entry.path();
+        let name = entry.file_name();
+        let meta = upath.symlink_metadata()?;
+        if is_whiteout(&meta) {
+            whiteouts.push(name);
+            continue;
+        }
+        check_overlay_xattrs(&upath)?;
+        let rel_path = rel.join(&name);
+        if meta.is_dir() {
+            if let Some(val) = redirect_value(&upath) {
+                // Resolve + validate the untrusted redirect value to a
+                // root-relative in-tree source (or abort). `rel` is the dir
+                // containing the entry.
+                let source = normalize_redirect(&val, rel)?;
+                ops.push(Op::Redirect {
+                    rel: rel_path.clone(),
+                    mode: meta.mode(),
+                    source,
+                });
+            } else {
+                ops.push(Op::Dir {
+                    rel: rel_path.clone(),
+                    mode: meta.mode(),
+                    opaque: is_opaque(&upath),
+                });
             }
-            count += 1;
-            if path.symlink_metadata()?.is_dir() {
-                stack.push((path, rel_path));
-            }
+            subdirs.push((upath, rel_path));
+        } else if meta.file_type().is_symlink() {
+            let target = std::fs::read_link(&upath)?;
+            ops.push(Op::Symlink {
+                rel: rel_path,
+                target,
+            });
+        } else {
+            ops.push(Op::File {
+                rel: rel_path,
+                mode: meta.mode(),
+            });
         }
     }
-    Ok(count)
+    // Children after their parent dir op (so parents exist first).
+    for (upath, rel_path) in subdirs {
+        classify(&upath, &rel_path, ops)?;
+    }
+    // Whiteouts last within this level.
+    for name in whiteouts {
+        ops.push(Op::Whiteout {
+            rel: rel.join(name),
+        });
+    }
+    Ok(())
 }
 
 fn lower_kind(lower: &Path) -> Option<std::fs::FileType> {
@@ -514,13 +583,14 @@ fn walk_changes(
 }
 
 // ---------------------------------------------------------------------------
-// Mutate-time containment: every real-file mutation below is performed
-// relative to a directory fd obtained by walking the path one component at a
-// time with `O_NOFOLLOW`, rooted at a verified tree root. A symlink at any
-// component (from either layer, including one planted earlier in the same
-// replay) makes the open fail, so no mutation can be redirected out of the
-// tree. This is the TOCTOU-safe half of the redirect containment; the static
-// check in validate_upper is the necessary-but-not-sufficient half.
+// Mutate-time containment: every real-file mutation below — and every
+// upper-side read — is performed relative to a directory fd obtained by
+// walking the path one component at a time with `O_NOFOLLOW`, rooted at a
+// verified root. A symlink at any component (from either layer, including one
+// planted between the classify and apply passes) makes the open fail, so no
+// read or write can be redirected out of its tree. This is the TOCTOU-safe
+// half of the redirect containment; the static check in `classify` is the
+// necessary-but-not-sufficient half.
 // ---------------------------------------------------------------------------
 
 fn cstr(s: &OsStr) -> Result<CString> {
@@ -725,65 +795,145 @@ fn symlink_at(dirfd: i32, name: &OsStr, target: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Replay the upper layer onto the real tree, `dst_fd` being the verified fd
-/// of the lower directory matching `upper_dir`, `root_fd` the verified tree
-/// root (for absolute redirect resolution). Fail-stop and idempotent.
-fn replay_dir(
-    upper_dir: &Path,
-    dst_fd: &OwnedFd,
-    root_fd: &OwnedFd,
-    applied: &mut usize,
-) -> Result<()> {
-    for entry in std::fs::read_dir(upper_dir)? {
-        let entry = entry?;
-        let upath = entry.path();
-        let name = entry.file_name();
-        let meta = upath.symlink_metadata()?;
+/// Open a directory by path, refusing to follow a final symlink.
+fn open_dir_nofollow(path: &Path) -> Result<OwnedFd> {
+    let c = CString::new(path.as_os_str().as_bytes())?;
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(errno()).with_context(|| format!("open {} (nofollow dir)", path.display()));
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
 
-        if is_whiteout(&meta) {
-            remove_at(dst_fd.as_raw_fd(), &name)?;
-            *applied += 1;
-        } else if meta.is_dir() {
-            if let Some(val) = redirect_value(&upath) {
-                // A directory rename: move the (validated, in-tree) lower
-                // source into this name, then apply this dir's own changes.
-                let absolute = Path::new(&val).is_absolute();
-                let base = if absolute { root_fd } else { dst_fd };
-                let norm = normalize_redirect(&val, &PathBuf::new())?;
-                let (src_parent, src_name) = resolve_parent_nofollow(base, &norm)?;
-                remove_at(dst_fd.as_raw_fd(), &name)?;
-                let dc = cstr(&name)?;
-                let sc = cstr(&src_name)?;
-                if unsafe {
-                    libc::renameat(
-                        src_parent.as_raw_fd(),
-                        sc.as_ptr(),
-                        dst_fd.as_raw_fd(),
-                        dc.as_ptr(),
-                    )
-                } < 0
-                {
-                    return Err(errno()).with_context(|| format!("redirect rename into {name:?}"));
-                }
-            } else if is_opaque(&upath) {
-                remove_at(dst_fd.as_raw_fd(), &name)?;
-                ensure_dir_at(dst_fd.as_raw_fd(), &name, meta.mode())?;
-            } else {
-                ensure_dir_at(dst_fd.as_raw_fd(), &name, meta.mode())?;
-            }
-            let child = open_dir_nofollow_at(dst_fd.as_raw_fd(), &name)?;
-            fchmod(child.as_raw_fd(), meta.mode())?;
-            *applied += 1;
-            replay_dir(&upath, &child, root_fd, applied)?;
-        } else if meta.file_type().is_symlink() {
-            let dest = std::fs::read_link(&upath)?;
-            symlink_at(dst_fd.as_raw_fd(), &name, &dest)?;
-            *applied += 1;
-        } else {
-            let data = std::fs::read(&upath)?;
-            write_file_at(dst_fd.as_raw_fd(), &name, &data, meta.mode())?;
-            *applied += 1;
-        }
+/// `renameat(src_parent/src_name -> dst_parent/dst_name)`.
+fn renameat(
+    src_parent: &OwnedFd,
+    src_name: &OsStr,
+    dst_parent: &OwnedFd,
+    dst_name: &OsStr,
+) -> Result<()> {
+    let sc = cstr(src_name)?;
+    let dc = cstr(dst_name)?;
+    if unsafe {
+        libc::renameat(
+            src_parent.as_raw_fd(),
+            sc.as_ptr(),
+            dst_parent.as_raw_fd(),
+            dc.as_ptr(),
+        )
+    } < 0
+    {
+        return Err(errno()).with_context(|| format!("rename into {dst_name:?}"));
     }
     Ok(())
+}
+
+/// Read a regular file `name` under `dirfd`, refusing a symlink at the final
+/// component (`O_NOFOLLOW`) — so a swapped upper component cannot redirect the
+/// read outside the upper layer.
+fn read_file_nofollow(dirfd: i32, name: &OsStr) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let c = cstr(name)?;
+    let fd = unsafe {
+        libc::openat(
+            dirfd,
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(errno()).with_context(|| format!("open upper {name:?} (nofollow)"));
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)
+        .with_context(|| format!("read upper {name:?}"))?;
+    Ok(buf)
+}
+
+/// Mutation pass: apply the classified operation list. It never re-reads
+/// either layer's directory structure — every path is resolved by an
+/// `O_NOFOLLOW` component walk from a verified root fd (the tree root for the
+/// write side, the upper root for the read side), so a symlink planted
+/// between the passes cannot redirect a read or a write out of its tree.
+fn apply_ops(
+    ops: &[Op],
+    root_fd: &OwnedFd,
+    upper_root_fd: &OwnedFd,
+    applied: &mut usize,
+) -> Result<()> {
+    for op in ops {
+        match op {
+            Op::Whiteout { rel } => {
+                let (parent, name) = resolve_parent_nofollow(root_fd, rel)?;
+                remove_at(parent.as_raw_fd(), &name)?;
+            }
+            Op::Dir { rel, mode, opaque } => {
+                let (parent, name) = resolve_parent_nofollow(root_fd, rel)?;
+                if *opaque {
+                    remove_at(parent.as_raw_fd(), &name)?;
+                }
+                ensure_dir_at(parent.as_raw_fd(), &name, *mode)?;
+                let child = open_dir_nofollow_at(parent.as_raw_fd(), &name)?;
+                fchmod(child.as_raw_fd(), *mode)?;
+            }
+            Op::Redirect { rel, mode, source } => {
+                let (src_parent, src_name) = resolve_parent_nofollow(root_fd, source)?;
+                let (dst_parent, dst_name) = resolve_parent_nofollow(root_fd, rel)?;
+                remove_at(dst_parent.as_raw_fd(), &dst_name)?;
+                renameat(&src_parent, &src_name, &dst_parent, &dst_name)?;
+                let child = open_dir_nofollow_at(dst_parent.as_raw_fd(), &dst_name)?;
+                fchmod(child.as_raw_fd(), *mode)?;
+            }
+            Op::Symlink { rel, target } => {
+                let (parent, name) = resolve_parent_nofollow(root_fd, rel)?;
+                symlink_at(parent.as_raw_fd(), &name, target)?;
+            }
+            Op::File { rel, mode } => {
+                let (up_parent, up_name) = resolve_parent_nofollow(upper_root_fd, rel)?;
+                let data = read_file_nofollow(up_parent.as_raw_fd(), &up_name)?;
+                let (parent, name) = resolve_parent_nofollow(root_fd, rel)?;
+                write_file_at(parent.as_raw_fd(), &name, &data, *mode)?;
+            }
+        }
+        *applied += 1;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The upper-side read path is fd-anchored just like the write side: a
+    // symlink at any component of an upper path refuses the read, so a
+    // component swapped to a symlink between the classify and apply passes
+    // cannot redirect a read out of the upper layer (the (c) TOCTOU detail).
+    #[test]
+    fn read_and_resolve_refuse_symlink_components() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = open_dir_nofollow(tmp.path()).unwrap();
+
+        std::fs::write(tmp.path().join("f"), b"real bytes").unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", tmp.path().join("link")).unwrap();
+        std::fs::create_dir(tmp.path().join("d")).unwrap();
+        std::fs::write(tmp.path().join("d/x"), b"x").unwrap();
+        std::os::unix::fs::symlink("d", tmp.path().join("sdir")).unwrap();
+
+        // A real file reads back; a symlink at the final component is refused.
+        assert_eq!(
+            read_file_nofollow(base.as_raw_fd(), OsStr::new("f")).unwrap(),
+            b"real bytes"
+        );
+        assert!(read_file_nofollow(base.as_raw_fd(), OsStr::new("link")).is_err());
+
+        // An intermediate symlink component is refused; the real dir resolves.
+        assert!(resolve_parent_nofollow(&base, Path::new("sdir/x")).is_err());
+        assert!(resolve_parent_nofollow(&base, Path::new("d/x")).is_ok());
+    }
 }

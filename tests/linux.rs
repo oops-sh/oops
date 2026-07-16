@@ -444,25 +444,33 @@ fn command_in_sandbox_cannot_umount_or_escape() {
     std::fs::write(t.join("keep.txt"), "real").unwrap();
 
     // The wrapped command runs in the nested child userns (B). It tries the
-    // documented escapes; both must fail, and its write must land in the
-    // overlay upper — the real file stays "real". If umount had escaped, the
-    // `echo` would hit the real keep.txt.
+    // documented escapes: umount, nsenter into pid 1's mount ns, AND nsenter
+    // into the launcher's mount ns ($PPID — the `oops run` process that owns
+    // userns A's ancestor). All must fail, and its write must land in the
+    // overlay upper — the real file stays "real". If any escape had worked,
+    // the `echo` would hit the real keep.txt.
     run_ok(
         &t,
         "umount -l . 2>umount.err || true; \
          nsenter --mount=/proc/1/ns/mnt true 2>nsenter.err || true; \
+         nsenter --mount=/proc/$PPID/ns/mnt true 2>launcher.err || true; \
          echo hacked > keep.txt",
     );
     let (dir, _) = session_record_for(&t).expect("session pending");
     let umount_err = std::fs::read_to_string(dir.join("upper/umount.err")).unwrap_or_default();
     let nsenter_err = std::fs::read_to_string(dir.join("upper/nsenter.err")).unwrap_or_default();
+    let launcher_err = std::fs::read_to_string(dir.join("upper/launcher.err")).unwrap_or_default();
     assert!(
         !umount_err.is_empty(),
         "umount from userns B must fail (produce an error)"
     );
     assert!(
         !nsenter_err.is_empty(),
-        "nsenter from userns B must fail (produce an error)"
+        "nsenter into pid 1's mount ns from userns B must fail"
+    );
+    assert!(
+        !launcher_err.is_empty(),
+        "nsenter/setns into the launcher's mount ns from userns B must fail"
     );
     assert_eq!(
         std::fs::read_to_string(t.join("keep.txt")).unwrap(),

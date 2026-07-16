@@ -57,6 +57,16 @@ which layer a symlink component originates in — a symlink newly created in the
 upper layer counts exactly as a pre-existing lower one; traversing any symlink
 component aborts.
 
+The mutation pass MUST act only on the operation set recorded by the
+read-only classification pass and MUST NOT re-read the upper layer's
+structure to decide what to do — so a metadata or path-structure change
+between the two passes cannot steer a real-file mutation. Both sides of every
+operation are resolved by these `O_NOFOLLOW` component walks: the write side
+from the verified tree root, and the read side (reading a file's bytes out of
+the upper layer) from the verified upper-layer root. No step re-parses a path
+string at mutate time, so neither a read nor a write can be redirected out of
+its tree by a component swapped to a symlink between the passes.
+
 The anchor for "inside the protected tree" MUST be the target tree root's
 canonical path together with its recorded device and inode identity
 (`st_dev`, `st_ino`) captured **before the command executed** — the same

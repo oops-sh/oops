@@ -76,16 +76,20 @@ launcher MUST create the overlay mount inside an unprivileged user namespace
 ("A") that it owns, and MUST execute the wrapped command inside a **nested
 child user namespace** ("B") that is a descendant of A and therefore holds no
 `CAP_SYS_ADMIN` over A's mount namespace. As a result, a process in B MUST
-NOT be able to unmount the sandbox (`umount`/`umount -l` fail) nor enter the
-parent mount namespace (`nsenter` fails), and its writes MUST be confined to
-the upper layer with the real lower tree left byte-identical. The finalize
-actions (`undo`, `commit`) MUST run in the launcher's context, never inside
-B; B MUST NOT possess the means to finalize the session. This is the Linux
-tier-3 authority boundary defined in the confinement spike.
+NOT be able to unmount the sandbox (`umount`/`umount -l` fail) nor enter any
+ancestor mount namespace — neither pid 1's nor the launcher's (`nsenter`/
+`setns` fail). The command's writes **within the sandboxed target subtree**
+MUST land in the upper layer with the real lower tree left byte-identical;
+writes outside that subtree are not part of this boundary and are governed by
+the honest guarantee boundary (see safety's "Honest guarantee boundary" — the
+undo guarantee covers only the target tree). The finalize actions (`undo`,
+`commit`) MUST run in the launcher's context, never inside B; B MUST NOT
+possess the means to finalize the session. This is the Linux tier-3 authority
+boundary defined in the confinement spike.
 
 #### Scenario: Command in the nested userns cannot dismantle the sandbox
-- **WHEN** the wrapped command (running in userns B) attempts `umount -l` of the target or `nsenter` into pid 1's mount namespace
-- **THEN** both fail, the overlay stays mounted, and the command's filesystem writes remain in the upper layer
+- **WHEN** the wrapped command (running in userns B) attempts `umount -l` of the target, or `nsenter`/`setns` into pid 1's mount namespace or the launcher's mount namespace
+- **THEN** all fail, the overlay stays mounted, and the command's writes within the target subtree remain in the upper layer
 
 #### Scenario: Rootless run needs no root
 - **WHEN** `oops run "touch x"` is invoked by an unprivileged user on a kernel with unprivileged user namespaces and unprivileged overlayfs available
