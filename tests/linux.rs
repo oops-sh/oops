@@ -575,6 +575,39 @@ fn gc_quarantines_old_orphans() {
 }
 
 #[test]
+fn rootless_trash_is_reclaimed_by_gc() {
+    container_only!();
+    let target = make_target();
+    let t = target.path().canonicalize().unwrap();
+    std::fs::create_dir_all(t.join("sub")).unwrap();
+    std::fs::write(t.join("sub/a"), "x").unwrap();
+
+    // A rootless overlay leaves a mode-000 `work/work` in the session; undo
+    // trashes the whole session dir. gc must reclaim it — which needs an
+    // identity-mapped userns for CAP_DAC_OVERRIDE over that dir (the plain
+    // owner cannot enter mode 000). Poll a few explicit sweeps, mirroring the
+    // APFS displaced_tree_from_undo_is_reclaimed_by_gc test.
+    //
+    // NOTE: this runs as root in the container, where root can already delete
+    // mode 000, so it is a regression guard (gc reclaims trash and the new
+    // userns entry does not break it). The true non-root reclaim is asserted
+    // by spikes/confinement/bare_metal_acceptance.sh on real VMs.
+    run_ok(&t, "rm -rf sub");
+    oops_in(&t, &["undo"]);
+    let trash = state_dir_for(&t).join("oops/trash");
+    let mut empty = false;
+    for _ in 0..50 {
+        oops_in(&t, &["__gc"]);
+        if std::fs::read_dir(&trash).map(|d| d.count()).unwrap_or(0) == 0 {
+            empty = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(empty, "rootless trash must be reclaimed by gc");
+}
+
+#[test]
 #[ignore = "benchmark: run via `make bench-linux`"]
 fn bench_undo_under_100ms_on_repo_sized_tree() {
     container_only!();

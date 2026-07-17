@@ -228,6 +228,27 @@ fn remove_all(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Enter an identity-mapped user namespace so gc can reclaim rootless-overlay
+/// leftovers. A rootless overlay mount leaves a `work/work` directory owned by
+/// the (single) mapped uid with mode 000: the plain unprivileged user cannot
+/// delete it, so `trash/` would grow unboundedly. As root inside a user
+/// namespace that maps that uid we hold `CAP_DAC_OVERRIDE` over it and can
+/// remove it. Best-effort and only meaningful in a short-lived `__gc` process
+/// (it changes the process's user namespace): on any failure gc proceeds
+/// without it, reclaiming whatever is already deletable.
+#[cfg(target_os = "linux")]
+pub fn enter_gc_userns() {
+    use nix::sched::{unshare, CloneFlags};
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    if unshare(CloneFlags::CLONE_NEWUSER).is_err() {
+        return;
+    }
+    let _ = std::fs::write("/proc/self/setgroups", b"deny");
+    let _ = std::fs::write("/proc/self/uid_map", format!("0 {uid} 1"));
+    let _ = std::fs::write("/proc/self/gid_map", format!("0 {gid} 1"));
+}
+
 /// Spawn a detached background `oops __gc` so undo can return immediately.
 /// Failure to spawn is non-fatal: the next run's sweep will finish the job.
 pub fn spawn_background_gc() {
