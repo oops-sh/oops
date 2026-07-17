@@ -23,10 +23,30 @@ fn oops_bin() -> &'static str {
     env!("CARGO_BIN_EXE_oops")
 }
 
+/// A per-target `XDG_STATE_HOME`, derived deterministically from the target's
+/// (unique) tempdir name. This isolates parallel tests: `cargo test` runs
+/// them concurrently, and a single shared state root races (gc sweeps, trash
+/// churn, background gc). Each test's target has a unique basename, so each
+/// gets its own state root.
+///
+/// It MUST live under the container's tmpfs at `$HOME/.local/state/oops` —
+/// the overlay upperdir cannot itself be on overlayfs (the container root),
+/// which the kernel rejects — so per-test roots nest under that mount point.
+fn state_dir_for(target: &Path) -> PathBuf {
+    let tag = target.file_name().unwrap().to_string_lossy();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/root"));
+    home.join(".local/state/oops").join(tag.as_ref())
+}
+
 fn oops_in(dir: &Path, args: &[&str]) -> Output {
+    let state = state_dir_for(dir);
+    std::fs::create_dir_all(&state).ok();
     Command::new(oops_bin())
         .args(args)
         .current_dir(dir)
+        .env("XDG_STATE_HOME", &state)
         .output()
         .expect("failed to spawn oops")
 }
@@ -92,11 +112,7 @@ fn make_target() -> tempfile::TempDir {
 
 /// Locate the pending session record for a target by scanning the state dir.
 fn session_record_for(target: &Path) -> Option<(PathBuf, serde_json::Value)> {
-    let state = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap()).join(".local/state"))
-        .join("oops");
-    let sessions = state.join("sessions");
+    let sessions = state_dir_for(target).join("oops/sessions");
     for entry in std::fs::read_dir(sessions).ok()? {
         let dir = entry.ok()?.path();
         let Ok(raw) = std::fs::read_to_string(dir.join("session.json")) else {
@@ -289,11 +305,13 @@ fn commit_aborts_on_unrecognized_overlay_xattr_and_retry_completes() {
     let (dir, _) = session_record_for(&t).expect("session pending");
     let upper_newdir = dir.join("upper/newdir");
 
-    // Simulate upper-layer metadata we cannot replay (as if redirect_dir had
-    // been active). Commit must abort before touching the real tree and
-    // preserve the session, and a retry after fixing must complete — the
-    // fail-stop + idempotent-retry contract.
-    set_xattr(&upper_newdir, "trusted.overlay.redirect", b"/elsewhere");
+    // A genuinely-unrecognized overlay xattr (rootless mounts use the
+    // `user.overlay.*` namespace; `metacopy` is a feature we mount OFF and
+    // never replay). `redirect` is deliberately NOT used here — it is now a
+    // handled case (see commit_replays_directory_rename). Commit must abort
+    // before touching the real tree and preserve the session; a retry after
+    // removal must complete — the fail-stop + idempotent-retry contract.
+    set_xattr(&upper_newdir, "user.overlay.metacopy", b"y");
 
     let out = oops_in(&t, &["commit"]);
     assert!(!out.status.success());
@@ -311,7 +329,7 @@ fn commit_aborts_on_unrecognized_overlay_xattr_and_retry_completes() {
         "session must be preserved on failure"
     );
 
-    remove_xattr(&upper_newdir, "trusted.overlay.redirect");
+    remove_xattr(&upper_newdir, "user.overlay.metacopy");
     let out = oops_in(&t, &["commit"]);
     assert!(
         out.status.success(),
@@ -319,6 +337,147 @@ fn commit_aborts_on_unrecognized_overlay_xattr_and_retry_completes() {
         stderr(&out)
     );
     assert_eq!(std::fs::read_to_string(t.join("newdir/f")).unwrap(), "f\n");
+}
+
+#[test]
+fn commit_replays_directory_rename() {
+    container_only!();
+    let target = make_target();
+    let t = target.path().canonicalize().unwrap();
+
+    // Pre-existing dir in the lower tree, then renamed inside the sandbox.
+    // Under rootless (userxattr) mounts this is encoded as a
+    // `user.overlay.redirect` on the destination, which commit must replay.
+    std::fs::create_dir(t.join("olddir")).unwrap();
+    std::fs::write(t.join("olddir/f.txt"), "hello").unwrap();
+    std::fs::write(t.join("olddir/inner.txt"), "sub").unwrap();
+
+    run_ok(&t, "mv olddir newdir && echo two > newdir/added.txt");
+    let out = oops_in(&t, &["commit"]);
+    assert!(out.status.success(), "commit: {}", stderr(&out));
+
+    assert!(!t.join("olddir").exists(), "old name must be gone");
+    assert_eq!(
+        std::fs::read_to_string(t.join("newdir/f.txt")).unwrap(),
+        "hello"
+    );
+    assert_eq!(
+        std::fs::read_to_string(t.join("newdir/inner.txt")).unwrap(),
+        "sub"
+    );
+    assert_eq!(
+        std::fs::read_to_string(t.join("newdir/added.txt")).unwrap(),
+        "two\n"
+    );
+}
+
+#[test]
+fn commit_refuses_redirect_escaping_tree_via_dotdot() {
+    container_only!();
+    let target = make_target();
+    let t = target.path().canonicalize().unwrap();
+    // An out-of-tree sentinel a forged redirect would try to reach.
+    let secret = make_target();
+    let s = secret.path().canonicalize().unwrap();
+    std::fs::write(s.join("loot"), "TOP SECRET").unwrap();
+
+    run_ok(&t, "mkdir d");
+    let (dir, _) = session_record_for(&t).expect("session pending");
+    // `user.*` xattrs are owner-writable — a tier-3 agent could set this.
+    // Value escapes the tree via `..`.
+    let escape = format!("../..{}", s.display()); // e.g. ../../tmp/oops-test-XXX
+    set_xattr(
+        &dir.join("upper/d"),
+        "user.overlay.redirect",
+        escape.as_bytes(),
+    );
+
+    let out = oops_in(&t, &["commit"]);
+    assert!(!out.status.success(), "commit must abort");
+    assert!(
+        stderr(&out).contains("escapes the protected tree"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(
+        std::fs::read_to_string(s.join("loot")).unwrap(),
+        "TOP SECRET",
+        "out-of-tree sentinel must be byte-identical"
+    );
+}
+
+#[test]
+fn commit_refuses_redirect_through_symlink_at_mutate_time() {
+    container_only!();
+    let target = make_target();
+    let t = target.path().canonicalize().unwrap();
+    let secret = make_target();
+    let s = secret.path().canonicalize().unwrap();
+    std::fs::write(s.join("loot"), "TOP SECRET").unwrap();
+
+    // A symlink living in the real tree, pointing out of it. A redirect whose
+    // path traverses this symlink passes the static in-tree check (the name
+    // looks normal) but MUST be refused at mutate time by the O_NOFOLLOW walk.
+    std::os::unix::fs::symlink(&s, t.join("evil")).unwrap();
+
+    run_ok(&t, "mkdir d");
+    let (dir, _) = session_record_for(&t).expect("session pending");
+    set_xattr(&dir.join("upper/d"), "user.overlay.redirect", b"evil/loot");
+
+    let out = oops_in(&t, &["commit"]);
+    assert!(
+        !out.status.success(),
+        "commit must abort at the nofollow walk"
+    );
+    assert_eq!(
+        std::fs::read_to_string(s.join("loot")).unwrap(),
+        "TOP SECRET",
+        "out-of-tree sentinel must be byte-identical"
+    );
+}
+
+#[test]
+fn command_in_sandbox_cannot_umount_or_escape() {
+    container_only!();
+    let target = make_target();
+    let t = target.path().canonicalize().unwrap();
+    std::fs::write(t.join("keep.txt"), "real").unwrap();
+
+    // The wrapped command runs in the nested child userns (B). It tries the
+    // documented escapes: umount, nsenter into pid 1's mount ns, AND nsenter
+    // into the launcher's mount ns ($PPID — the `oops run` process that owns
+    // userns A's ancestor). All must fail, and its write must land in the
+    // overlay upper — the real file stays "real". If any escape had worked,
+    // the `echo` would hit the real keep.txt.
+    run_ok(
+        &t,
+        "umount -l . 2>umount.err || true; \
+         nsenter --mount=/proc/1/ns/mnt true 2>nsenter.err || true; \
+         nsenter --mount=/proc/$PPID/ns/mnt true 2>launcher.err || true; \
+         echo hacked > keep.txt",
+    );
+    let (dir, _) = session_record_for(&t).expect("session pending");
+    let umount_err = std::fs::read_to_string(dir.join("upper/umount.err")).unwrap_or_default();
+    let nsenter_err = std::fs::read_to_string(dir.join("upper/nsenter.err")).unwrap_or_default();
+    let launcher_err = std::fs::read_to_string(dir.join("upper/launcher.err")).unwrap_or_default();
+    assert!(
+        !umount_err.is_empty(),
+        "umount from userns B must fail (produce an error)"
+    );
+    assert!(
+        !nsenter_err.is_empty(),
+        "nsenter into pid 1's mount ns from userns B must fail"
+    );
+    assert!(
+        !launcher_err.is_empty(),
+        "nsenter/setns into the launcher's mount ns from userns B must fail"
+    );
+    assert_eq!(
+        std::fs::read_to_string(t.join("keep.txt")).unwrap(),
+        "real",
+        "the command's write must stay in the overlay upper, not the real tree"
+    );
+    let _ = oops_in(&t, &["undo"]);
 }
 
 #[test]
@@ -399,7 +558,7 @@ fn gc_quarantines_old_orphans() {
     let target = make_target();
     let t = target.path().canonicalize().unwrap();
 
-    let state = PathBuf::from(std::env::var_os("HOME").unwrap()).join(".local/state/oops");
+    let state = state_dir_for(&t).join("oops");
     let orphan = state.join("sessions/orphan-test-12345");
     std::fs::create_dir_all(&orphan).unwrap();
     // Age it past the gc quarantine threshold.

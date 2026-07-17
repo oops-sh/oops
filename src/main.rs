@@ -70,6 +70,10 @@ enum Cmd {
         work: PathBuf,
         #[arg(long)]
         marker: PathBuf,
+        /// Explicit privileged (root) fallback: plain mount ns, no nested
+        /// userns. Tier-1/2 only.
+        #[arg(long)]
+        privileged: bool,
         #[arg(value_name = "COMMAND")]
         command: String,
     },
@@ -106,12 +110,15 @@ fn dispatch(cmd: Cmd) -> Result<i32> {
             upper,
             work,
             marker,
+            privileged,
             command,
         } => {
             #[cfg(target_os = "linux")]
             {
                 // Only returns on error, always before the command has run.
-                backend::overlayfs::enter_and_exec(&target, &upper, &work, &marker, &command)?;
+                backend::overlayfs::enter_and_exec(
+                    &target, &upper, &work, &marker, &command, privileged,
+                )?;
                 unreachable!("enter_and_exec returned Ok without exec")
             }
             #[cfg(not(target_os = "linux"))]
