@@ -39,11 +39,15 @@ if ! command -v cargo >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y >/dev/null 2>&1
 fi
 . "$HOME/.cargo/env" 2>/dev/null || true
+# C toolchain is required to link the binary (rustup ships no linker), plus
+# attr (setfattr) and git. Do NOT swallow install errors.
 if command -v apt-get >/dev/null 2>&1; then
-  sudo apt-get -qq update >/dev/null 2>&1; sudo apt-get -qq install -y attr git >/dev/null 2>&1
+  sudo apt-get -qq update
+  sudo apt-get -qq install -y build-essential attr git || echo "WARN: apt install failed (see above)"
 elif command -v dnf >/dev/null 2>&1; then
-  sudo dnf -q install -y attr git >/dev/null 2>&1
+  sudo dnf -q install -y gcc attr git || echo "WARN: dnf install failed (see above)"
 fi
+command -v cc >/dev/null || command -v gcc >/dev/null || echo "WARN: still no C compiler after install"
 rm -rf ~/oops
 git clone -q --branch "$BRANCH" "$REPO" ~/oops 2>/dev/null || git clone -q "$REPO" ~/oops
 cd ~/oops || { echo "clone failed"; exit 3; }
@@ -63,8 +67,15 @@ overall=0
 for row in "${MATRIX[@]}"; do
   IFS='|' read -r name template fc <<<"$row"
   echo; echo "########## $name ($template) ##########"
-  limactl delete -f "$name" >/dev/null 2>&1 || true
-  if ! limactl start --name="$name" --tty=false "template://$template" >/dev/null 2>&1; then
+  # Reuse an existing VM (just ensure it is running); only create when absent.
+  # Set OOPS_VM_RECREATE=1 to force a clean rebuild.
+  if [ "${OOPS_VM_RECREATE:-0}" = "1" ]; then
+    limactl delete -f "$name" >/dev/null 2>&1 || true
+  fi
+  if limactl list -q 2>/dev/null | grep -qx "$name"; then
+    echo "reusing existing VM $name"
+    limactl start "$name" >/dev/null 2>&1 || true
+  elif ! limactl start --name="$name" --tty=false "template://$template" >/dev/null 2>&1; then
     echo "$name: VM start FAILED"; overall=1; continue
   fi
   guest_script | limactl shell "$name" bash -s -- "$REPO" "$BRANCH" "$fc" 2>&1 | tee "$OUT/$name.log"

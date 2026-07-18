@@ -45,7 +45,15 @@ hr "build / locate oops"
 if [ -n "${OOPS_BIN:-}" ] && [ -x "$OOPS_BIN" ]; then
   BIN="$OOPS_BIN"
 else
-  cargo build --release >/dev/null 2>&1 || { echo "cargo build failed"; exit 2; }
+  command -v cc >/dev/null || command -v gcc >/dev/null || \
+    echo "  WARNING: no C compiler (cc/gcc) on PATH — the linker will fail; install build-essential (Debian/Ubuntu) or gcc (Fedora)."
+  # Capture the build output; on failure print it (the linker/compiler error
+  # must reach the log — a verifier that swallows its subject's errors is a bug).
+  if ! build_out=$(cargo build --release 2>&1); then
+    echo "cargo build failed:"
+    echo "$build_out" | tail -40
+    exit 2
+  fi
   BIN="$(pwd)/target/release/oops"
 fi
 echo "  oops: $BIN"
