@@ -187,45 +187,52 @@ pub fn move_to_trash(roots: &StateRoots, root: &Path, session_dir: &Path) -> Res
 /// touches a session with a parseable record or one younger than
 /// GC_MIN_AGE_SECS.
 pub fn gc_sweep(roots: &StateRoots) -> Result<()> {
+    // Quarantine first: move recordless session dirs into trash (O(1) renames,
+    // no elevation needed).
+    for root in roots.mounted() {
+        let sessions = state::sessions_dir(&root);
+        if !sessions.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&sessions)? {
+            let dir = entry?.path();
+            if !dir.is_dir() || load(&dir).is_ok() {
+                continue;
+            }
+            let age = std::fs::metadata(&dir)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .map(|e| e.as_secs())
+                .unwrap_or(0);
+            if age >= GC_MIN_AGE_SECS {
+                let _ = move_to_trash(roots, &root, &dir);
+            }
+        }
+    }
+
+    // Then reclaim trash. On Linux this is fd-anchored and may elevate into an
+    // identity-mapped userns to punch through rootless mode-000 leftovers;
+    // containment is anchored on the registered roots BEFORE any elevation.
+    #[cfg(target_os = "linux")]
+    reap::reclaim_trash(roots);
+    #[cfg(not(target_os = "linux"))]
     for root in roots.mounted() {
         let trash = state::trash_dir(&root);
         if trash.is_dir() {
             for entry in std::fs::read_dir(&trash)? {
                 let path = entry?.path();
                 if roots.ensure_contains(&path).is_ok() {
-                    let _ = remove_all(&path);
-                }
-            }
-        }
-
-        let sessions = state::sessions_dir(&root);
-        if sessions.is_dir() {
-            for entry in std::fs::read_dir(&sessions)? {
-                let dir = entry?.path();
-                if !dir.is_dir() || load(&dir).is_ok() {
-                    continue;
-                }
-                let age = std::fs::metadata(&dir)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|m| m.elapsed().ok())
-                    .map(|e| e.as_secs())
-                    .unwrap_or(0);
-                if age >= GC_MIN_AGE_SECS {
-                    let _ = move_to_trash(roots, &root, &dir);
+                    let _ = if path.is_dir() {
+                        std::fs::remove_dir_all(&path)
+                    } else {
+                        std::fs::remove_file(&path)
+                    };
                 }
             }
         }
     }
     Ok(())
-}
-
-fn remove_all(path: &Path) -> std::io::Result<()> {
-    if path.is_dir() {
-        std::fs::remove_dir_all(path)
-    } else {
-        std::fs::remove_file(path)
-    }
 }
 
 /// Enter an identity-mapped user namespace so gc can reclaim rootless-overlay
@@ -237,7 +244,7 @@ fn remove_all(path: &Path) -> std::io::Result<()> {
 /// (it changes the process's user namespace): on any failure gc proceeds
 /// without it, reclaiming whatever is already deletable.
 #[cfg(target_os = "linux")]
-pub fn enter_gc_userns() {
+fn enter_gc_userns() {
     use nix::sched::{unshare, CloneFlags};
     let uid = unsafe { libc::geteuid() };
     let gid = unsafe { libc::getegid() };
@@ -247,6 +254,141 @@ pub fn enter_gc_userns() {
     let _ = std::fs::write("/proc/self/setgroups", b"deny");
     let _ = std::fs::write("/proc/self/uid_map", format!("0 {uid} 1"));
     let _ = std::fs::write("/proc/self/gid_map", format!("0 {gid} 1"));
+}
+
+/// Fd-anchored trash reclamation (Linux). gc now runs with `CAP_DAC_OVERRIDE`
+/// inside an identity-mapped userns, so the old "not enough permission" that
+/// incidentally guarded against following an agent-planted symlink is GONE —
+/// containment is now the only defense, and it is enforced exactly like commit
+/// replay: every path is reached by an `O_NOFOLLOW` component walk from a
+/// registered state root, deletion is `unlinkat`, and a symlink component is
+/// unlinked, never traversed. The containment anchor (opening each `trash/`
+/// from its registered root) is established BEFORE elevation; elevation only
+/// punches through the mode-000 dirs and every op stays relative to the
+/// anchored fds.
+#[cfg(target_os = "linux")]
+mod reap {
+    use super::{enter_gc_userns, StateRoots};
+    use std::ffi::{CString, OsStr, OsString};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    pub fn reclaim_trash(roots: &StateRoots) {
+        // Phase 1 (UNPRIVILEGED): the containment decision. Open each trash
+        // dir by an O_NOFOLLOW walk from its registered root, so the fd proves
+        // the dir is inside a registered root and was reached without
+        // traversing any symlink. Done before any elevation.
+        let mut trash_fds = Vec::new();
+        for root in roots.mounted() {
+            let Ok(root_fd) = open_dir_nofollow(&root) else {
+                continue;
+            };
+            if let Ok(tfd) = openat_dir_nofollow(root_fd.as_raw_fd(), OsStr::new("trash")) {
+                trash_fds.push(tfd);
+            }
+        }
+        if trash_fds.is_empty() {
+            return;
+        }
+        // Phase 2: elevate ONLY to punch through mode-000 dirs, then delete
+        // strictly relative to the anchored fds (no path is re-parsed).
+        enter_gc_userns();
+        for tfd in &trash_fds {
+            if let Ok(names) = read_dir_fd(tfd.as_raw_fd()) {
+                for name in names {
+                    rm_recursive_at(tfd.as_raw_fd(), &name);
+                }
+            }
+        }
+    }
+
+    fn open_dir_nofollow(path: &Path) -> std::io::Result<OwnedFd> {
+        let c = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let fd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn openat_dir_nofollow(dirfd: i32, name: &OsStr) -> std::io::Result<OwnedFd> {
+        let c = CString::new(name.as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let fd = unsafe {
+            libc::openat(
+                dirfd,
+                c.as_ptr(),
+                libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn read_dir_fd(dirfd: i32) -> std::io::Result<Vec<OsString>> {
+        let dup = unsafe { libc::dup(dirfd) };
+        if dup < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let dirp = unsafe { libc::fdopendir(dup) };
+        if dirp.is_null() {
+            unsafe { libc::close(dup) };
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut names = Vec::new();
+        loop {
+            let ent = unsafe { libc::readdir(dirp) };
+            if ent.is_null() {
+                break;
+            }
+            let cn = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+            let b = cn.to_bytes();
+            if b == b"." || b == b".." {
+                continue;
+            }
+            names.push(OsStr::from_bytes(b).to_os_string());
+        }
+        unsafe { libc::closedir(dirp) };
+        Ok(names)
+    }
+
+    /// Recursively remove `name` under `dirfd`, fd-anchored and `O_NOFOLLOW`:
+    /// a directory is entered via `openat(O_NOFOLLOW)` and emptied then
+    /// `rmdir`'d; a symlink (or any non-directory) is `unlinkat`'d — never
+    /// followed. So a symlink an agent planted in trash pointing out of the
+    /// tree is deleted as a link, and a directory component swapped to a
+    /// symlink between passes fails the `O_NOFOLLOW` open (its subtree is left
+    /// for a later sweep rather than followed out of the tree).
+    fn rm_recursive_at(dirfd: i32, name: &OsStr) {
+        let Ok(c) = CString::new(name.as_bytes()) else {
+            return;
+        };
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatat(dirfd, c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } < 0 {
+            return;
+        }
+        if (st.st_mode & libc::S_IFMT) == libc::S_IFDIR {
+            if let Ok(child) = openat_dir_nofollow(dirfd, name) {
+                if let Ok(names) = read_dir_fd(child.as_raw_fd()) {
+                    for n in names {
+                        rm_recursive_at(child.as_raw_fd(), &n);
+                    }
+                }
+                unsafe { libc::unlinkat(dirfd, c.as_ptr(), libc::AT_REMOVEDIR) };
+            }
+        } else {
+            unsafe { libc::unlinkat(dirfd, c.as_ptr(), 0) };
+        }
+    }
 }
 
 /// Spawn a detached background `oops __gc` so undo can return immediately.

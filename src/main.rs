@@ -102,14 +102,10 @@ fn dispatch(cmd: Cmd) -> Result<i32> {
         Cmd::Undo => undo(),
         Cmd::Commit => commit(),
         Cmd::Gc => {
-            // Enter a matching identity-mapped user namespace first (Linux):
-            // rootless overlay leaves `work/work` owned by the mapped uid with
-            // mode 000, which the plain unprivileged user cannot delete. As
-            // userns root here we hold CAP_DAC_OVERRIDE over the mapped uid and
-            // can reclaim it. Best-effort — if it fails, gc still runs and
-            // reclaims everything that is deletable without it.
-            #[cfg(target_os = "linux")]
-            session::enter_gc_userns();
+            // gc_sweep handles rootless reclamation internally on Linux: it
+            // anchors containment on the registered roots (fd-anchored,
+            // O_NOFOLLOW) BEFORE elevating into an identity-mapped userns to
+            // delete the mode-000 leftovers rootless overlay leaves behind.
             session::gc_sweep(&StateRoots::load()?)?;
             Ok(0)
         }

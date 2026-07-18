@@ -12,6 +12,16 @@
 - [x] 1.4 Reproduced the root cause as a non-root user (mode-000 `work/work`,
   owner = invoking uid, `rm` → Permission denied) and verified `__gc`
   reclaims it.
+- [x] 1.5 **Fd-anchored gc deletion** (review): trash reclamation walks each
+  `trash/` from its registered root with `O_NOFOLLOW`, deletes via `unlinkat`,
+  and never traverses a symlink — same standard as commit replay. Containment
+  anchor established BEFORE elevation; the userns only punches through
+  mode-000 dirs, every op relative to the anchored fds.
+- [x] 1.6 Adversarial test `gc_does_not_follow_trash_symlink_out_of_tree`
+  (container) + a matching check in the acceptance script (`6c`): plant an
+  out-of-tree symlink in the upper → undo → gc → sentinel byte-identical.
+- [x] 1.7 `spikes/confinement/vm_matrix.sh`: Lima orchestrator (build 3 VMs →
+  run acceptance → collect logs → dry-run stop, never publishes).
 
 ## 2. Fail-closed diagnostics (blocker 2)
 

@@ -110,6 +110,21 @@ if command -v setfattr >/dev/null; then
   ( cd "$d"; "$BIN" undo >/dev/null 2>&1 )
 fi
 
+hr "6c. gc must not follow an out-of-tree symlink in trash (needs no setfattr)"
+# gc now runs with CAP_DAC_OVERRIDE in a userns; the incidental permission
+# guard is gone, so containment is the only defense. Plant a symlink to the
+# out-of-tree sentinel in the upper, trash it, sweep, and require the sentinel
+# byte-identical (gc unlinked the symlink, never traversed it).
+d="$WORK/t6c"; mkdir -p "$d"; sec="$WORK/secret6c"; mkdir -p "$sec"
+echo SECRET > "$sec/loot"; shaB=$(sha1sum "$sec/loot" | cut -d' ' -f1)
+( cd "$d"; "$BIN" run "ln -s $sec evil" >/dev/null 2>&1; "$BIN" undo >/dev/null 2>&1 )
+for _ in 1 2 3; do "$BIN" __gc >/dev/null 2>&1; sleep 0.2; done
+if [ -f "$sec/loot" ] && [ "$(sha1sum "$sec/loot" | cut -d' ' -f1)" = "$shaB" ]; then
+  ok "gc did not follow the trash symlink; out-of-tree sentinel intact"
+else
+  bad "gc FOLLOWED an out-of-tree symlink in trash — containment breach"
+fi
+
 # --------------------------------------------------------------------------
 if [ "$FAILCLOSED" = "1" ]; then
   hr "7. fail-closed — restricted unprivileged userns refuses (needs sudo)"

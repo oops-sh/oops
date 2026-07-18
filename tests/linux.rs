@@ -608,6 +608,43 @@ fn rootless_trash_is_reclaimed_by_gc() {
 }
 
 #[test]
+fn gc_does_not_follow_trash_symlink_out_of_tree() {
+    container_only!();
+    let target = make_target();
+    let t = target.path().canonicalize().unwrap();
+    // An out-of-tree secret directory a trashed symlink points at.
+    let secret = make_target();
+    let s = secret.path().canonicalize().unwrap();
+    std::fs::write(s.join("loot"), "TOP SECRET").unwrap();
+
+    // The command plants a symlink IN THE UPPER layer pointing at the secret.
+    // undo trashes the session (upper/evil included). gc now reclaims trash
+    // with CAP_DAC_OVERRIDE — the incidental "permission denied" safety net is
+    // gone, so containment is the only defense: gc must unlink the symlink,
+    // never traverse it out of the tree.
+    run_ok(&t, &format!("ln -s {} evil", s.display()));
+    oops_in(&t, &["undo"]);
+
+    let trash = state_dir_for(&t).join("oops/trash");
+    for _ in 0..50 {
+        oops_in(&t, &["__gc"]);
+        if std::fs::read_dir(&trash).map(|d| d.count()).unwrap_or(0) == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        s.join("loot").exists(),
+        "gc must not have deleted through the out-of-tree symlink"
+    );
+    assert_eq!(
+        std::fs::read_to_string(s.join("loot")).unwrap(),
+        "TOP SECRET",
+        "out-of-tree sentinel must be byte-identical after gc"
+    );
+}
+
+#[test]
 #[ignore = "benchmark: run via `make bench-linux`"]
 fn bench_undo_under_100ms_on_repo_sized_tree() {
     container_only!();
