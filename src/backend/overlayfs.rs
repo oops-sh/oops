@@ -170,6 +170,29 @@ fn overlay_mount_data(target: &Path, upper: &Path, work: &Path) -> String {
     )
 }
 
+/// The full, actionable diagnostic for a failed rootless-userns setup.
+/// Restricted unprivileged user namespaces (notably Ubuntu 23.10+'s AppArmor
+/// default) do NOT make `unshare` fail — `unshare` succeeds but the new userns
+/// is stripped of the capability to write its own id map, so the failure
+/// surfaces later as EPERM writing `/proc/self/uid_map`. Both failure sites
+/// route here so the message is the same and always names the knob and the
+/// explicit fallback. See openspec/specs/sandbox "Privileged fallback".
+fn rootless_userns_error(stage: &str, e: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!(
+        "rootless sandbox setup failed at {stage}: {e}\n\
+         oops needs unprivileged user namespaces (Linux kernel >= 5.11).\n\
+         They appear to be restricted here — on Ubuntu 23.10+ they are \
+         restricted by default (an AppArmor policy). Enable them:\n  \
+         sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0\n  \
+         persist: echo 'kernel.apparmor_restrict_unprivileged_userns=0' | \
+         sudo tee /etc/sysctl.d/60-oops-userns.conf\n  \
+         (older Debian instead: sudo sysctl -w kernel.unprivileged_userns_clone=1)\n\
+         Or re-run with OOPS_PRIVILEGED=1 to use the privileged fallback — this \
+         requires root and gives only the weaker tier-1/2 guarantee (no nested \
+         user namespace; a cooperative agent can unmount the sandbox)."
+    )
+}
+
 /// Write a single-identity uid/gid map for the current process's user
 /// namespace: `0 <outer_id> 1`. `setgroups` is denied first, which
 /// unprivileged gid mapping requires. This needs no `/etc/subuid` ranges and
@@ -223,18 +246,13 @@ pub fn enter_and_exec(
         // User namespace A owns the mount namespace. A single unshare of both
         // puts us in a new userns (initially unmapped/nobody) with a new mount
         // ns; writing the identity map makes us uid 0 in A with full caps
-        // there, enough to mount the overlay.
-        unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS).map_err(|e| {
-            anyhow::anyhow!(
-                "unshare(CLONE_NEWUSER|CLONE_NEWNS) failed: {e}.\n\
-                 Rootless oops needs unprivileged user namespaces (kernel >= 5.11).\n\
-                 If your distro restricts them, enable one of:\n  \
-                 sysctl kernel.unprivileged_userns_clone=1   (Debian/older)\n  \
-                 sysctl kernel.apparmor_restrict_unprivileged_userns=0   (Ubuntu 23.10+)\n\
-                 or re-run with OOPS_PRIVILEGED=1 (requires root; weaker, tier-1/2 guarantee)."
-            )
-        })?;
-        write_identity_maps(outer_uid, outer_gid)?;
+        // there, enough to mount the overlay. On a restricted host the unshare
+        // may succeed but the id-map write then fails with EPERM — both route
+        // through the same actionable diagnostic.
+        unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS)
+            .map_err(|e| rootless_userns_error("unshare(CLONE_NEWUSER|CLONE_NEWNS)", e))?;
+        write_identity_maps(outer_uid, outer_gid)
+            .map_err(|e| rootless_userns_error("writing the user-namespace id map", e))?;
     }
 
     mount(

@@ -83,11 +83,18 @@ dismantle: it cannot unmount the sandbox, escape the mount namespace, or
 reach the real files — so an agent placed inside cannot force its changes
 onto disk (the commit/undo decision stays outside). This targets a
 prompt-injected agent (tier 3); a tier-4 adversary engineering a kernel or
-hypervisor escape is out of scope and needs a hardware-isolated VM. Where
-unprivileged user namespaces are unavailable (older kernels, some
-Debian/Ubuntu AppArmor policies), `oops run` refuses with the sysctl to
-change, and an explicit `OOPS_PRIVILEGED=1` root fallback exists (weaker,
-tier-1/2, no nested namespace).
+hypervisor escape is out of scope and needs a hardware-isolated VM.
+
+Verified rootless on kernels 6.1–6.19, ext4 and btrfs. **Debian 12 and
+Fedora 44 work out of the box with no root.** **Ubuntu 24.04's default
+AppArmor policy blocks unprivileged user namespaces**, so oops fails closed
+there until you either run
+`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (persist it in
+`/etc/sysctl.d/`) or use `OOPS_PRIVILEGED=1` — the latter requires root and is
+honestly only the weaker tier-1/2 fallback (no nested namespace). That is the
+honest parenthesis on "no root required": it holds out of the box on distros
+that ship unprivileged userns enabled, and needs one sysctl on those that
+don't.
 
 On macOS, between `run` and `undo`/`commit` your real files hold the
 command's changes: file watchers, editors, Spotlight, and cloud sync

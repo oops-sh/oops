@@ -110,6 +110,21 @@ if command -v setfattr >/dev/null; then
   ( cd "$d"; "$BIN" undo >/dev/null 2>&1 )
 fi
 
+hr "6c. gc must not follow an out-of-tree symlink in trash (needs no setfattr)"
+# gc now runs with CAP_DAC_OVERRIDE in a userns; the incidental permission
+# guard is gone, so containment is the only defense. Plant a symlink to the
+# out-of-tree sentinel in the upper, trash it, sweep, and require the sentinel
+# byte-identical (gc unlinked the symlink, never traversed it).
+d="$WORK/t6c"; mkdir -p "$d"; sec="$WORK/secret6c"; mkdir -p "$sec"
+echo SECRET > "$sec/loot"; shaB=$(sha1sum "$sec/loot" | cut -d' ' -f1)
+( cd "$d"; "$BIN" run "ln -s $sec evil" >/dev/null 2>&1; "$BIN" undo >/dev/null 2>&1 )
+for _ in 1 2 3; do "$BIN" __gc >/dev/null 2>&1; sleep 0.2; done
+if [ -f "$sec/loot" ] && [ "$(sha1sum "$sec/loot" | cut -d' ' -f1)" = "$shaB" ]; then
+  ok "gc did not follow the trash symlink; out-of-tree sentinel intact"
+else
+  bad "gc FOLLOWED an out-of-tree symlink in trash — containment breach"
+fi
+
 # --------------------------------------------------------------------------
 if [ "$FAILCLOSED" = "1" ]; then
   hr "7. fail-closed — restricted unprivileged userns refuses (needs sudo)"
@@ -123,13 +138,36 @@ if [ "$FAILCLOSED" = "1" ]; then
     out=$( cd "$d"; "$BIN" run 'touch fc_evidence' 2>&1 ); rc=$?
     if [ $rc -ne 0 ] && [ ! -e "$d/fc_evidence" ]; then
       ok "refused when userns restricted (command never ran)"
-      echo "$out" | grep -qiE 'user namespace|apparmor|OOPS_PRIVILEGED' && ok "message names the knob / opt-in" || bad "message not actionable: $out"
+      # STRICT: the message must name the actual knob (full sysctl) AND the
+      # OOPS_PRIVILEGED fallback — both, not either. A message that only says
+      # "user namespace" (the old uid_map EPERM context) must FAIL here.
+      if echo "$out" | grep -q 'apparmor_restrict_unprivileged_userns' \
+         && echo "$out" | grep -q 'OOPS_PRIVILEGED'; then
+        ok "message names the knob (full sysctl) AND the OOPS_PRIVILEGED fallback"
+      else
+        bad "message not actionable (needs knob full-name + OOPS_PRIVILEGED): $out"
+      fi
     else
       bad "did NOT fail closed under restriction (rc=$rc)"
     fi
     sudo sysctl -w "$knob=$orig" >/dev/null
     echo "  restored $knob=$orig"
   fi
+fi
+
+# --------------------------------------------------------------------------
+hr "8. state root is reclaimable (no un-deletable rootless leftovers)"
+# rootless overlay leaves a mode-000 work/work owned by the mapped uid; gc must
+# reclaim it via an identity-mapped userns, else trash/ grows forever and the
+# user cannot even rm it by hand. Drive a few sweeps, then require emptiness.
+for _ in 1 2 3 4 5; do "$BIN" __gc >/dev/null 2>&1; sleep 0.3; done
+left=$(find "$XDG_STATE_HOME/oops/sessions" "$XDG_STATE_HOME/oops/trash" -mindepth 1 2>/dev/null | wc -l)
+[ "$left" -eq 0 ] && ok "state root fully reclaimed (sessions/ and trash/ empty)" \
+                  || bad "state root NOT reclaimed: $left entries linger (trash blocker)"
+if rm -rf "$XDG_STATE_HOME/oops" 2>/dev/null && [ ! -e "$XDG_STATE_HOME/oops" ]; then
+  ok "the plain user can remove the whole state dir (no permission leftovers)"
+else
+  bad "state dir NOT removable by the plain user (un-reclaimable rootless files)"
 fi
 
 # --------------------------------------------------------------------------

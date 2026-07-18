@@ -102,6 +102,10 @@ fn dispatch(cmd: Cmd) -> Result<i32> {
         Cmd::Undo => undo(),
         Cmd::Commit => commit(),
         Cmd::Gc => {
+            // gc_sweep handles rootless reclamation internally on Linux: it
+            // anchors containment on the registered roots (fd-anchored,
+            // O_NOFOLLOW) BEFORE elevating into an identity-mapped userns to
+            // delete the mode-000 leftovers rootless overlay leaves behind.
             session::gc_sweep(&StateRoots::load()?)?;
             Ok(0)
         }
